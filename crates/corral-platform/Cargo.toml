@@ -1,0 +1,27 @@
+[package]
+name = "corral-platform"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+corral-core = { path = "../corral-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+subtle.workspace = true
+hex.workspace = true
+rusqlite.workspace = true
+rcgen.workspace = true
+time.workspace = true
+windows-sys.workspace = true
+
+[lints]
+workspace = true

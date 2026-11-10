@@ -1,0 +1,19 @@
+[package]
+name = "corral-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "corral-mcp"
+path = "src/main.rs"
+
+[dependencies]
+corral-core = { path = "../corral-core" }
+corral-platform = { path = "../corral-platform" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+**/target/
+
+# Node / Vite
+node_modules/
+/dist/
+**/dist/
+
+# Env & local files
+.env
+.env.*
+*.local
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

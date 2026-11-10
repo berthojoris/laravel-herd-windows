@@ -1,0 +1,43 @@
+name: Release Corral (Windows x64)
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust stable toolchain (x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Setup Node.js LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build Frontend (Svelte 5 + TypeScript + Vite)
+        working-directory: ui
+        run: |
+          npm install
+          npm run build
+
+      - name: Verify Zero-Crash Clippy Policy
+        run: |
+          cargo clippy --workspace -- -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::indexing_slicing
+
+      - name: Run Workspace Unit & Integration Tests
+        run: |
+          cargo test --workspace
+
+      - name: Build Release Binaries (Windows x64)
+        run: |
+          cargo build --workspace --release
