@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{Site, WorkerKind};
+use crate::domain::{MailAttachment, MailMessage, Site, WorkerKind};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -225,12 +225,29 @@ pub struct LogLine {
 pub struct MailSummaryView {
     pub id: String,
     pub received_at: i64,
-    pub from: String,
-    pub to: Vec<String>,
+    pub envelope_from: String,
+    pub recipients: Vec<String>,
     pub subject: String,
     pub preview: String,
+    pub attachments: Vec<MailAttachment>,
     pub has_attachments: bool,
     pub read: bool,
+}
+
+impl MailSummaryView {
+    pub fn from_domain(mail: &MailMessage) -> Self {
+        Self {
+            id: mail.id.clone(),
+            received_at: mail.received_at,
+            envelope_from: mail.envelope_from.clone(),
+            recipients: mail.recipients.clone(),
+            subject: mail.subject.clone(),
+            preview: mail.preview.clone(),
+            has_attachments: !mail.attachments.is_empty(),
+            attachments: mail.attachments.clone(),
+            read: mail.read,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

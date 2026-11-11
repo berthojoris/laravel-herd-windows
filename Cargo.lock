@@ -427,6 +427,7 @@ version = "1.0.0"
 dependencies = [
  "corral-core",
  "corral-platform",
+ "semver",
  "serde",
  "serde_json",
  "tauri",

@@ -1,11 +1,16 @@
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use corral_core::domain::{render_nginx_site_conf, AppSettings, Certificate, Site};
 use corral_core::error::AppError;
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::fs_store::write_atomic;
+use crate::io_util::run_command_bounded;
+
+const NGINX_CMD_MAX_OUTPUT: usize = 64 * 1024;
+const NGINX_CMD_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct NginxController {
     etc_dir: PathBuf,
@@ -138,20 +143,42 @@ impl NginxController {
         }
 
         let master_conf = self.etc_dir.join("nginx.conf");
-        let test_out = std::process::Command::new(&self.nginx_bin)
-            .args(["-t", "-c", &master_conf.to_string_lossy()])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()?;
+        let master_conf_arg = master_conf.to_string_lossy().to_string();
+        let mut test_cmd = std::process::Command::new(&self.nginx_bin);
+        test_cmd
+            .args(["-t", "-c", &master_conf_arg])
+            .creation_flags(CREATE_NO_WINDOW);
+        let test_out = run_command_bounded(
+            &mut test_cmd,
+            None,
+            NGINX_CMD_MAX_OUTPUT,
+            NGINX_CMD_TIMEOUT,
+        )?;
 
-        if !test_out.status.success() {
-            let stderr = String::from_utf8_lossy(&test_out.stderr).to_string();
-            return Err(AppError::NginxConfig(stderr));
+        if test_out.timed_out {
+            return Err(AppError::NginxConfig(
+                "Validasi `nginx -t` melampaui batas waktu 10 detik".to_string(),
+            ));
+        }
+        if !test_out.success {
+            let detail = if test_out.stderr.trim().is_empty() {
+                test_out.stdout
+            } else {
+                test_out.stderr
+            };
+            return Err(AppError::NginxConfig(detail));
         }
 
-        let _ = std::process::Command::new(&self.nginx_bin)
-            .args(["-s", "reload", "-c", &master_conf.to_string_lossy()])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
+        let mut reload_cmd = std::process::Command::new(&self.nginx_bin);
+        reload_cmd
+            .args(["-s", "reload", "-c", &master_conf_arg])
+            .creation_flags(CREATE_NO_WINDOW);
+        let _ = run_command_bounded(
+            &mut reload_cmd,
+            None,
+            NGINX_CMD_MAX_OUTPUT,
+            NGINX_CMD_TIMEOUT,
+        );
 
         Ok(())
     }

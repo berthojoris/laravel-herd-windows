@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use corral_core::domain::{ServiceId, ServiceInstance, ServiceState};
 use corral_core::dto::ArtisanOutputDto;
@@ -10,7 +10,29 @@ use corral_core::error::AppError;
 use corral_core::ports::{ProcessSupervisorPort, RepositoryPort, ServiceSpec};
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
+use crate::io_util::{kill_and_reap_bounded, run_command_bounded};
 use crate::job::JobHandle;
+
+const ARTISAN_MAX_OUTPUT_BYTES: usize = 512 * 1024;
+const ARTISAN_TIMEOUT: Duration = Duration::from_secs(30);
+const CHILD_STOP_MAX_WAIT: Duration = Duration::from_millis(500);
+
+fn is_blocking_artisan_subcommand(subcmd: &str) -> bool {
+    matches!(
+        subcmd.to_ascii_lowercase().as_str(),
+        "queue:work"
+            | "queue:listen"
+            | "schedule:work"
+            | "reverb:start"
+            | "octane:start"
+            | "octane:frankenphp"
+            | "octane:roadrunner"
+            | "octane:swoole"
+            | "pail"
+            | "serve"
+            | "tinker"
+    )
+}
 
 pub struct ServiceSupervisor {
     job: JobHandle,
@@ -41,18 +63,65 @@ impl ServiceSupervisor {
         })
     }
 
+    pub fn job_handle(&self) -> &JobHandle {
+        &self.job
+    }
+
     pub fn set_service_state(&self, id: &str, state: ServiceState, pid: Option<u32>) {
         if let Ok(mut guard) = self.states.lock() {
             guard.insert(id.to_string(), (state, pid));
         }
     }
 
-    pub fn shutdown_all(&self) {
+    fn take_child(&self, id: &str) -> Option<std::process::Child> {
+        self.children
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.remove(id))
+    }
+
+    fn reap_finished_children(&self) {
+        let mut exited: Vec<(ServiceId, i32)> = Vec::new();
         if let Ok(mut children) = self.children.lock() {
-            for (_, mut child) in children.drain() {
-                let _ = child.kill();
-                let _ = child.wait();
+            children.retain(|id, child| match child.try_wait() {
+                Ok(Some(status)) => {
+                    let code = status.code().unwrap_or(-1);
+                    exited.push((id.clone(), code));
+                    false
+                }
+                Ok(None) => true,
+                Err(_) => {
+                    exited.push((id.clone(), -1));
+                    false
+                }
+            });
+        }
+        if !exited.is_empty() {
+            if let Ok(mut states) = self.states.lock() {
+                for (id, code) in exited {
+                    let next_state = if code == 0 {
+                        ServiceState::Stopped
+                    } else {
+                        ServiceState::Failed {
+                            code,
+                            reason: format!("Proses berhenti dengan kode keluar {code}"),
+                        }
+                    };
+                    states.insert(id, (next_state, None));
+                }
             }
+        }
+    }
+
+    pub fn shutdown_all(&self) {
+        let drained: Vec<std::process::Child> = self
+            .children
+            .lock()
+            .map(|mut guard| guard.drain().map(|(_, c)| c).collect())
+            .unwrap_or_default();
+
+        for mut child in drained {
+            kill_and_reap_bounded(&mut child, CHILD_STOP_MAX_WAIT);
         }
         self.job.terminate_all();
 
@@ -83,6 +152,17 @@ impl ServiceSupervisor {
     ) -> Result<ArtisanOutputDto, AppError> {
         let started = Instant::now();
         let args: Vec<&str> = artisan_cmd.split_whitespace().collect();
+        let Some(&subcmd) = args.first() else {
+            return Err(AppError::Validation(
+                "Perintah Artisan tidak boleh kosong.".to_string(),
+            ));
+        };
+
+        if is_blocking_artisan_subcommand(subcmd) {
+            return Err(AppError::Validation(format!(
+                "Perintah `php artisan {subcmd}` bersifat daemon/interaktif dan tidak boleh dijalankan sebagai perintah sekali jalan. Gunakan tab Workers & Reverb untuk mengelola proses latar belakang."
+            )));
+        }
 
         if let Some(bin) = php_bin {
             if bin.is_file() {
@@ -91,16 +171,25 @@ impl ServiceSupervisor {
                     .arg("artisan")
                     .args(&args)
                     .creation_flags(CREATE_NO_WINDOW);
-                if let Ok(output) = cmd.output() {
-                    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(1);
-                    return Ok(ArtisanOutputDto {
-                        command: format!("php artisan {artisan_cmd}"),
-                        exit_code: output.status.code().unwrap_or(0),
-                        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                        duration_ms,
-                    });
+                let out = run_command_bounded(
+                    &mut cmd,
+                    Some(&self.job),
+                    ARTISAN_MAX_OUTPUT_BYTES,
+                    ARTISAN_TIMEOUT,
+                )?;
+                if out.timed_out {
+                    return Err(AppError::Io(format!(
+                        "Perintah `php artisan {artisan_cmd}` melampaui batas waktu 30 detik dan dihentikan oleh Corral."
+                    )));
                 }
+                let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(1);
+                return Ok(ArtisanOutputDto {
+                    command: format!("php artisan {artisan_cmd}"),
+                    exit_code: out.exit_code,
+                    stdout: out.stdout,
+                    stderr: out.stderr,
+                    duration_ms,
+                });
             }
         }
 
@@ -148,21 +237,35 @@ impl ServiceSupervisor {
 
 impl ProcessSupervisorPort for ServiceSupervisor {
     fn start(&self, spec: ServiceSpec) -> Result<ServiceId, AppError> {
+        // Ensure any previous process under the same ServiceId is terminated & reaped before replacing.
+        if let Some(mut old_child) = self.take_child(&spec.id) {
+            kill_and_reap_bounded(&mut old_child, CHILD_STOP_MAX_WAIT);
+        }
+
         if let Some(ref prog) = spec.program {
             if prog.is_file() {
                 let mut cmd = std::process::Command::new(prog);
-                cmd.args(&spec.args).creation_flags(CREATE_NO_WINDOW);
+                cmd.args(&spec.args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .creation_flags(CREATE_NO_WINDOW);
                 if let Some(ref wd) = spec.working_dir {
                     cmd.current_dir(wd);
                 }
                 for (k, v) in &spec.env {
                     cmd.env(k, v);
                 }
-                let child = cmd.spawn()?;
+                let mut child = cmd.spawn()?;
                 let pid = child.id();
-                self.job.assign_child(&child)?;
+                if let Err(err) = self.job.assign_child(&child) {
+                    kill_and_reap_bounded(&mut child, CHILD_STOP_MAX_WAIT);
+                    return Err(err);
+                }
                 if let Ok(mut ch) = self.children.lock() {
-                    ch.insert(spec.id.clone(), child);
+                    if let Some(mut displaced) = ch.insert(spec.id.clone(), child) {
+                        kill_and_reap_bounded(&mut displaced, CHILD_STOP_MAX_WAIT);
+                    }
                 }
                 self.set_service_state(&spec.id, ServiceState::Running, Some(pid));
                 return Ok(spec.id);
@@ -186,11 +289,8 @@ impl ProcessSupervisorPort for ServiceSupervisor {
     }
 
     fn stop(&self, id: &str) -> Result<(), AppError> {
-        if let Ok(mut ch) = self.children.lock() {
-            if let Some(mut child) = ch.remove(id) {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        if let Some(mut child) = self.take_child(id) {
+            kill_and_reap_bounded(&mut child, CHILD_STOP_MAX_WAIT);
         }
         self.set_service_state(id, ServiceState::Stopped, None);
         if let Ok(services) = self.repo.list_services() {
@@ -226,6 +326,7 @@ impl ProcessSupervisorPort for ServiceSupervisor {
     }
 
     fn status(&self, id: &str) -> ServiceState {
+        self.reap_finished_children();
         if let Ok(guard) = self.states.lock() {
             if let Some((st, _)) = guard.get(id) {
                 return st.clone();
@@ -235,6 +336,7 @@ impl ProcessSupervisorPort for ServiceSupervisor {
     }
 
     fn list(&self) -> Result<Vec<ServiceInstance>, AppError> {
+        self.reap_finished_children();
         let mut services = self.repo.list_services()?;
         if let Ok(guard) = self.states.lock() {
             for svc in &mut services {

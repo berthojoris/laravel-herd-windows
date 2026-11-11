@@ -2,6 +2,7 @@ pub mod dumps;
 pub mod fs_store;
 pub mod hosts;
 pub mod ini;
+pub mod io_util;
 pub mod job;
 pub mod nginx;
 pub mod port;
@@ -13,11 +14,16 @@ pub mod trust;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use std::io::Cursor;
+    use std::sync::Arc;
+
     use corral_core::ports::{RepositoryPort, TrustStorePort};
 
     use crate::hosts::{compute_helper_hmac, verify_helper_hmac, DEFAULT_HELPER_HMAC_KEY};
     use crate::ini::PhpRuntimeManager;
+    use crate::io_util::{read_bounded_sync_line, read_tail_lines, BoundedLine};
     use crate::job::JobHandle;
+    use crate::process::ServiceSupervisor;
     use crate::smtp::parse_raw_smtp_payload;
     use crate::sqlite::SqliteRepository;
     use crate::trust::TlsCertificateManager;
@@ -50,7 +56,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sqlite_repository_roundtrip() {
+    fn test_sqlite_repository_roundtrip_and_summaries() {
         let tmp = std::env::temp_dir().join(format!("corral-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let db_file = tmp.join("corral.db");
@@ -60,16 +66,30 @@ mod tests {
         let repo = SqliteRepository::open(&db_file, &herd_dir).unwrap();
         let sites = repo.list_sites().unwrap();
         assert!(sites.len() >= 2);
+        assert!(repo.get_site("laravel-commerce").unwrap().is_some());
         let services = repo.list_services().unwrap();
         assert!(services.len() >= 6);
-        let mails = repo.list_mails().unwrap();
-        assert!(!mails.is_empty());
+        let summaries = repo.list_mail_summaries().unwrap();
+        assert!(!summaries.is_empty());
+        let (total, unread) = repo.count_mails().unwrap();
+        assert_eq!(total, summaries.len());
+        assert_eq!(unread, summaries.len());
+        let first_id = summaries.first().unwrap().id.clone();
+        assert!(repo.get_mail(&first_id).unwrap().is_some());
+
+        // Verify blocking Artisan daemon subcommands are rejected cleanly.
+        let repo_arc: Arc<dyn RepositoryPort> = Arc::new(repo);
+        let supervisor = ServiceSupervisor::new(repo_arc).unwrap();
+        let err = supervisor
+            .run_artisan(&herd_dir, None, "queue:work --tries=3")
+            .unwrap_err();
+        assert!(err.to_string().contains("daemon"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn test_php_ini_manager_and_tls_ca_generation() {
+    fn test_php_ini_manager_and_tls_ca_generation_and_cert_cache() {
         let tmp = std::env::temp_dir().join(format!("corral-ini-tls-{}", uuid::Uuid::new_v4()));
         let php_mgr = PhpRuntimeManager::new(tmp.join("php"));
         let ini = php_mgr.read_ini("8.4").unwrap();
@@ -79,10 +99,55 @@ mod tests {
         let tls_mgr = TlsCertificateManager::new(tmp.join("ca"), tmp.join("ca/sites"));
         let ca = tls_mgr.ensure_ca().unwrap();
         assert!(!ca.ca_thumbprint.is_empty());
-        let leaf = tls_mgr
-            .issue_site_cert(&["shop.test".to_string(), "www.shop.test".to_string()])
-            .unwrap();
+        let hosts = vec!["shop.test".to_string(), "www.shop.test".to_string()];
+        let leaf = tls_mgr.issue_site_cert(&hosts).unwrap();
         assert!(leaf.leaf_path.is_file());
+        let first_pem = std::fs::read_to_string(&leaf.leaf_path).unwrap();
+
+        // Second call with identical SANs reuses the existing certificate without regenerating keys.
+        let leaf_cached = tls_mgr.issue_site_cert(&hosts).unwrap();
+        let second_pem = std::fs::read_to_string(&leaf_cached.leaf_path).unwrap();
+        assert_eq!(first_pem, second_pem);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_bounded_io_utilities() {
+        let tmp = std::env::temp_dir().join(format!("corral-io-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let log_file = tmp.join("big.log");
+
+        let mut content = String::new();
+        for i in 1..=1000 {
+            content.push_str(&format!("line-{i:04}-payload-0123456789\n"));
+        }
+        std::fs::write(&log_file, content).unwrap();
+
+        // Seek only the last 4 KB and extract at most 10 lines.
+        let tail = read_tail_lines(&log_file, 4096, 10).unwrap();
+        assert_eq!(tail.len(), 10);
+        assert_eq!(tail.last().unwrap(), "line-1000-payload-0123456789");
+
+        // Sync bounded line reader handles normal, oversized, and EOF lines safely.
+        let raw_stream = b"short-line\r\n0123456789ABCDEF_TOO_LONG\nnext-ok\n";
+        let mut cursor = Cursor::new(&raw_stream[..]);
+        assert_eq!(
+            read_bounded_sync_line(&mut cursor, 16).unwrap(),
+            BoundedLine::Line("short-line".to_string())
+        );
+        assert_eq!(
+            read_bounded_sync_line(&mut cursor, 16).unwrap(),
+            BoundedLine::Oversized("0123456789ABCDEF".to_string())
+        );
+        assert_eq!(
+            read_bounded_sync_line(&mut cursor, 16).unwrap(),
+            BoundedLine::Line("next-ok".to_string())
+        );
+        assert_eq!(
+            read_bounded_sync_line(&mut cursor, 16).unwrap(),
+            BoundedLine::Eof
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -121,31 +121,123 @@ pub fn render_hosts_file_with_block(
 }
 
 /// Sanitize HTML email body for safe `<iframe sandbox="allow-same-origin" srcdoc="...">` preview (§12).
+/// Runs in linear O(N) time without full-document lowercasing clones or slice-indexing panics.
 pub fn sanitize_email_html(raw_html: &str) -> String {
-    let mut current = raw_html.to_string();
-    // Strip <script ...>...</script> case-insensitively
-    while let Some(start) = current.to_ascii_lowercase().find("<script") {
-        if let Some(end_rel) = current
-            .get(start..)
-            .and_then(|s| s.to_ascii_lowercase().find("</script>"))
-        {
-            let remove_until = start.saturating_add(end_rel).saturating_add(9);
-            current.replace_range(start..remove_until, "");
-        } else {
-            current.truncate(start);
-            break;
+    use std::borrow::Cow;
+
+    fn starts_with_ignore_ascii_case_at(haystack: &[u8], pos: usize, needle: &[u8]) -> bool {
+        haystack
+            .get(pos..pos.saturating_add(needle.len()))
+            .is_some_and(|sub| sub.eq_ignore_ascii_case(needle))
+    }
+
+    // Pass 1: Strip `<script ...>...</script>` (or unclosed `<script...` to EOF) case-insensitively.
+    let bytes = raw_html.as_bytes();
+    let len = bytes.len();
+    let mut without_scripts: Option<String> = None;
+    let mut chunk_start: usize = 0;
+    let mut i: usize = 0;
+
+    while i < len {
+        if bytes.get(i) == Some(&b'<') && starts_with_ignore_ascii_case_at(bytes, i, b"<script") {
+            let buf = without_scripts.get_or_insert_with(|| String::with_capacity(len));
+            if let Some(seg) = raw_html.get(chunk_start..i) {
+                buf.push_str(seg);
+            }
+
+            let mut j = i.saturating_add(7);
+            let mut closed_end: Option<usize> = None;
+            while j < len {
+                if bytes.get(j) == Some(&b'<')
+                    && starts_with_ignore_ascii_case_at(bytes, j, b"</script")
+                {
+                    let mut k = j.saturating_add(8);
+                    while k < len && bytes.get(k) != Some(&b'>') {
+                        k = k.saturating_add(1);
+                    }
+                    closed_end = Some(if k < len { k.saturating_add(1) } else { len });
+                    break;
+                }
+                j = j.saturating_add(1);
+            }
+
+            if let Some(next_pos) = closed_end {
+                i = next_pos;
+                chunk_start = next_pos;
+                continue;
+            } else {
+                chunk_start = len;
+                break;
+            }
         }
+        i = i.saturating_add(1);
     }
-    // Neutralize inline event handlers (`onload=`, `onerror=`, `onclick=`)
-    for handler in [
-        "onload=",
-        "onerror=",
-        "onclick=",
-        "onmouseover=",
-        "onfocus=",
-        "javascript:",
-    ] {
-        current = current.replace(handler, "data-blocked=");
+
+    let stage1: Cow<'_, str> = match without_scripts {
+        Some(mut buf) => {
+            if chunk_start < len {
+                if let Some(seg) = raw_html.get(chunk_start..len) {
+                    buf.push_str(seg);
+                }
+            }
+            Cow::Owned(buf)
+        }
+        None => Cow::Borrowed(raw_html),
+    };
+
+    // Pass 2: Neutralize inline event handlers and script URI schemes case-insensitively in O(N).
+    const BLOCKED_PATTERNS: &[&[u8]] = &[
+        b"onload=",
+        b"onerror=",
+        b"onclick=",
+        b"onmouseover=",
+        b"onfocus=",
+        b"onmouseenter=",
+        b"onloadstart=",
+        b"ontoggle=",
+        b"onsubmit=",
+        b"javascript:",
+        b"vbscript:",
+    ];
+
+    let src = stage1.as_ref();
+    let src_bytes = src.as_bytes();
+    let src_len = src_bytes.len();
+    let mut sanitized: Option<String> = None;
+    let mut p2_chunk_start: usize = 0;
+    let mut p2_i: usize = 0;
+
+    while p2_i < src_len {
+        let lower_first = src_bytes.get(p2_i).map(u8::to_ascii_lowercase);
+        if matches!(lower_first, Some(b'o' | b'j' | b'v')) {
+            let matched_len = BLOCKED_PATTERNS
+                .iter()
+                .find(|pat| starts_with_ignore_ascii_case_at(src_bytes, p2_i, pat))
+                .map(|pat| pat.len());
+
+            if let Some(pat_len) = matched_len {
+                let buf = sanitized.get_or_insert_with(|| String::with_capacity(src_len));
+                if let Some(seg) = src.get(p2_chunk_start..p2_i) {
+                    buf.push_str(seg);
+                }
+                buf.push_str("data-blocked=");
+                p2_i = p2_i.saturating_add(pat_len);
+                p2_chunk_start = p2_i;
+                continue;
+            }
+        }
+        p2_i = p2_i.saturating_add(1);
     }
-    current
+
+    match sanitized {
+        Some(mut buf) => {
+            if p2_chunk_start < src_len {
+                if let Some(seg) = src.get(p2_chunk_start..src_len) {
+                    buf.push_str(seg);
+                }
+            }
+            buf
+        }
+        None => stage1.into_owned(),
+    }
 }

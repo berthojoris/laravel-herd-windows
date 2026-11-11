@@ -10,11 +10,22 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
     SanType,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::fs_store::write_atomic;
+use crate::io_util::run_command_bounded;
+
+const CERT_RENEW_SAFETY_SECS: i64 = 7 * 86_400;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedSiteCertMeta {
+    hostnames: Vec<String>,
+    ca_thumbprint: String,
+    not_after: i64,
+}
 
 pub struct TlsCertificateManager {
     ca_dir: PathBuf,
@@ -124,6 +135,34 @@ impl TrustStorePort for TlsCertificateManager {
 
         let leaf_path = self.sites_dir.join(format!("{primary}.pem"));
         let key_path = self.sites_dir.join(format!("{primary}.key"));
+        let meta_path = self.sites_dir.join(format!("{primary}.meta.json"));
+
+        let mut sorted_hosts: Vec<String> = hostnames.to_vec();
+        sorted_hosts.sort();
+        sorted_hosts.dedup();
+
+        let now = OffsetDateTime::now_utc();
+        let now_ts = now.unix_timestamp();
+
+        if leaf_path.is_file() && key_path.is_file() && meta_path.is_file() {
+            if let Ok(meta_raw) = std::fs::read_to_string(&meta_path) {
+                if let Ok(meta) = serde_json::from_str::<CachedSiteCertMeta>(&meta_raw) {
+                    if meta.ca_thumbprint == ca_info.ca_thumbprint
+                        && meta.hostnames == sorted_hosts
+                        && meta.not_after > now_ts.saturating_add(CERT_RENEW_SAFETY_SECS)
+                    {
+                        return Ok(Certificate {
+                            host: primary,
+                            ca_thumbprint: ca_info.ca_thumbprint,
+                            leaf_path,
+                            key_path,
+                            not_after: meta.not_after,
+                            trusted: ca_info.trusted,
+                        });
+                    }
+                }
+            }
+        }
 
         let mut params = CertificateParams::default();
         let mut dn = DistinguishedName::new();
@@ -132,7 +171,7 @@ impl TrustStorePort for TlsCertificateManager {
         params.distinguished_name = dn;
 
         let mut sans = Vec::new();
-        for h in hostnames {
+        for h in &sorted_hosts {
             if let Ok(ia5) = h.clone().try_into() {
                 sans.push(SanType::DnsName(ia5));
             }
@@ -141,9 +180,10 @@ impl TrustStorePort for TlsCertificateManager {
         params.subject_alt_names = sans;
 
         // CA/B Forum max validity <= 396 days (TLS-1)
-        let now = OffsetDateTime::now_utc();
+        let not_after_dt = now + Duration::days(395);
+        let not_after_ts = not_after_dt.unix_timestamp();
         params.not_before = now - Duration::days(1);
-        params.not_after = now + Duration::days(395);
+        params.not_after = not_after_dt;
 
         let key_pair = KeyPair::generate()
             .map_err(|e| AppError::Io(format!("gagal membuat kunci leaf TLS: {e}")))?;
@@ -154,12 +194,21 @@ impl TrustStorePort for TlsCertificateManager {
         write_atomic(&leaf_path, cert.pem().as_bytes())?;
         write_atomic(&key_path, key_pair.serialize_pem().as_bytes())?;
 
+        let meta = CachedSiteCertMeta {
+            hostnames: sorted_hosts,
+            ca_thumbprint: ca_info.ca_thumbprint.clone(),
+            not_after: not_after_ts,
+        };
+        if let Ok(meta_bytes) = serde_json::to_vec(&meta) {
+            let _ = write_atomic(&meta_path, &meta_bytes);
+        }
+
         Ok(Certificate {
             host: primary,
             ca_thumbprint: ca_info.ca_thumbprint,
             leaf_path,
             key_path,
-            not_after: (now + Duration::days(395)).unix_timestamp(),
+            not_after: not_after_ts,
             trusted: ca_info.trusted,
         })
     }
@@ -168,11 +217,30 @@ impl TrustStorePort for TlsCertificateManager {
         if !pem.is_file() {
             let _ = self.ensure_ca()?;
         }
-        // Best-effort install into CurrentUser Root Certificate Store via certutil
-        let _ = std::process::Command::new("certutil")
-            .args(["-user", "-f", "-addstore", "Root", &pem.to_string_lossy()])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
+        let mut cmd = std::process::Command::new("certutil");
+        cmd.args(["-user", "-f", "-addstore", "Root", &pem.to_string_lossy()])
+            .creation_flags(CREATE_NO_WINDOW);
+        let out = run_command_bounded(
+            &mut cmd,
+            None,
+            64 * 1024,
+            std::time::Duration::from_secs(60),
+        )?;
+        if out.timed_out {
+            return Err(AppError::Io(
+                "Batas waktu konfirmasi Windows Certificate Store habis (60 detik)".to_string(),
+            ));
+        }
+        if !out.success {
+            let detail = if out.stderr.trim().is_empty() {
+                out.stdout.trim().to_string()
+            } else {
+                out.stderr.trim().to_string()
+            };
+            return Err(AppError::Io(format!(
+                "Gagal memasang CA ke Windows Trust Store: {detail}"
+            )));
+        }
 
         let marker = self.ca_dir.join(".trusted");
         let _ = std::fs::write(marker, b"1");
@@ -183,15 +251,20 @@ impl TrustStorePort for TlsCertificateManager {
     }
 
     fn remove_ca(&self, _thumbprint: &str) -> Result<(), AppError> {
-        let _ = std::process::Command::new("certutil")
-            .args([
-                "-user",
-                "-delstore",
-                "Root",
-                "Corral Local Development CA",
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
+        let mut cmd = std::process::Command::new("certutil");
+        cmd.args([
+            "-user",
+            "-delstore",
+            "Root",
+            "Corral Local Development CA",
+        ])
+        .creation_flags(CREATE_NO_WINDOW);
+        let _ = run_command_bounded(
+            &mut cmd,
+            None,
+            64 * 1024,
+            std::time::Duration::from_secs(15),
+        );
 
         let marker = self.ca_dir.join(".trusted");
         let _ = std::fs::remove_file(marker);

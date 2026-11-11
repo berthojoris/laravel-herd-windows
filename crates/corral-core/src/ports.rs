@@ -4,6 +4,7 @@ use crate::domain::{
     Certificate, DumpEntry, HostEntry, MailMessage, ServiceId, ServiceInstance, ServiceKind,
     ServiceState, Site, SiteId, Workspace,
 };
+use crate::dto::MailSummaryView;
 use crate::error::CoreError;
 
 #[derive(Debug, Clone)]
@@ -52,6 +53,8 @@ pub trait RepositoryPort: Send + Sync {
     fn delete_service(&self, id: &str) -> Result<(), CoreError>;
 
     fn list_mails(&self) -> Result<Vec<MailMessage>, CoreError>;
+    fn list_mail_summaries(&self) -> Result<Vec<MailSummaryView>, CoreError>;
+    fn count_mails(&self) -> Result<(usize, usize), CoreError>;
     fn get_mail(&self, id: &str) -> Result<Option<MailMessage>, CoreError>;
     fn insert_mail(&self, mail: &MailMessage) -> Result<(), CoreError>;
     fn mark_mail_read(&self, id: &str) -> Result<(), CoreError>;

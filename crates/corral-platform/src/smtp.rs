@@ -1,11 +1,21 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use corral_core::application::sanitize_email_html;
 use corral_core::domain::MailMessage;
 use corral_core::ports::RepositoryPort;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+
+use crate::io_util::{read_bounded_line, BoundedLine};
+
+const MAX_CONCURRENT_SMTP_CLIENTS: usize = 32;
+const MAX_SMTP_LINE_BYTES: usize = 64 * 1024;
+const MAX_SMTP_DATA_BYTES: usize = 10 * 1024 * 1024;
+const MAX_RCPT_TO: usize = 100;
+const SMTP_LINE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Spawn an embedded async SMTP server on `127.0.0.1:<port>` (default 1025) that captures outgoing
 /// Laravel `Mail::to(...)->send()` messages directly into SQLite (MAIL-1).
@@ -36,6 +46,7 @@ pub fn spawn_smtp_server(
                     return;
                 };
                 tracing::info!("Corral SMTP Mail Catcher aktif di {addr}");
+                let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_SMTP_CLIENTS));
 
                 loop {
                     tokio::select! {
@@ -44,9 +55,18 @@ pub fn spawn_smtp_server(
                         }
                         accept_res = listener.accept() => {
                             if let Ok((stream, _peer)) = accept_res {
+                                let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                                    drop(stream);
+                                    continue;
+                                };
                                 let repo_clone = repo.clone();
+                                let client_cancel = cancel.clone();
                                 tokio::spawn(async move {
-                                    let _ = handle_smtp_client(stream, repo_clone).await;
+                                    let _permit = permit;
+                                    tokio::select! {
+                                        _ = client_cancel.cancelled() => {}
+                                        _ = handle_smtp_client(stream, repo_clone) => {}
+                                    }
                                 });
                             }
                         }
@@ -61,7 +81,7 @@ async fn handle_smtp_client(
     repo: Arc<dyn RepositoryPort>,
 ) -> std::io::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
 
     writer
         .write_all(b"220 corral.local ESMTP Corral Mail Catcher Ready\r\n")
@@ -70,20 +90,62 @@ async fn handle_smtp_client(
     let mut mail_from = String::from("app@corral.test");
     let mut rcpt_to: Vec<String> = Vec::new();
     let mut in_data = false;
+    let mut data_overflow = false;
     let mut raw_data = String::new();
 
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        let line = match read_bounded_line(&mut reader, MAX_SMTP_LINE_BYTES, SMTP_LINE_TIMEOUT)
+            .await?
+        {
+            BoundedLine::Eof => break,
+            BoundedLine::Oversized(prefix) => {
+                if in_data {
+                    data_overflow = true;
+                    if raw_data.len() < MAX_SMTP_DATA_BYTES {
+                        let remaining = MAX_SMTP_DATA_BYTES.saturating_sub(raw_data.len());
+                        if let Some(chunk) = prefix.get(..remaining.min(prefix.len())) {
+                            raw_data.push_str(chunk);
+                        }
+                    }
+                    continue;
+                } else {
+                    writer.write_all(b"500 5.5.2 Line too long\r\n").await?;
+                    continue;
+                }
+            }
+            BoundedLine::Line(line) => line,
+        };
+
         if in_data {
             if line == "." {
                 in_data = false;
-                let msg = parse_raw_smtp_payload(&mail_from, &rcpt_to, &raw_data);
-                let _ = repo.insert_mail(&msg);
+                if data_overflow {
+                    writer
+                        .write_all(b"552 5.3.4 Message size exceeds fixed maximum message size\r\n")
+                        .await?;
+                } else {
+                    let msg = parse_raw_smtp_payload(&mail_from, &rcpt_to, &raw_data);
+                    let repo_for_insert = repo.clone();
+                    let _ = tokio::task::spawn_blocking(move || repo_for_insert.insert_mail(&msg))
+                        .await;
+                    writer.write_all(b"250 2.0.0 Ok: queued by Corral\r\n").await?;
+                }
                 raw_data.clear();
-                writer.write_all(b"250 2.0.0 Ok: queued by Corral\r\n").await?;
-            } else {
-                let unstuffed = line.strip_prefix("..").unwrap_or(&line);
-                raw_data.push_str(unstuffed);
-                raw_data.push_str("\r\n");
+                raw_data.shrink_to(4096);
+                data_overflow = false;
+            } else if !data_overflow {
+                let unstuffed = line.strip_prefix('.').unwrap_or(&line);
+                if raw_data
+                    .len()
+                    .saturating_add(unstuffed.len())
+                    .saturating_add(2)
+                    > MAX_SMTP_DATA_BYTES
+                {
+                    data_overflow = true;
+                } else {
+                    raw_data.push_str(unstuffed);
+                    raw_data.push_str("\r\n");
+                }
             }
             continue;
         }
@@ -91,17 +153,27 @@ async fn handle_smtp_client(
         let upper = line.to_ascii_uppercase();
         if upper.starts_with("EHLO") || upper.starts_with("HELO") {
             writer
-                .write_all(b"250-corral.local\r\n250-SIZE 52428800\r\n250 8BITMIME\r\n")
+                .write_all(b"250-corral.local\r\n250-SIZE 10485760\r\n250 8BITMIME\r\n")
                 .await?;
         } else if upper.starts_with("MAIL FROM:") {
             mail_from = extract_angle_addr(&line);
             rcpt_to.clear();
+            raw_data.clear();
+            data_overflow = false;
             writer.write_all(b"250 2.1.0 Ok\r\n").await?;
         } else if upper.starts_with("RCPT TO:") {
-            rcpt_to.push(extract_angle_addr(&line));
-            writer.write_all(b"250 2.1.5 Ok\r\n").await?;
+            if rcpt_to.len() >= MAX_RCPT_TO {
+                writer
+                    .write_all(b"452 4.5.3 Too many recipients\r\n")
+                    .await?;
+            } else {
+                rcpt_to.push(extract_angle_addr(&line));
+                writer.write_all(b"250 2.1.5 Ok\r\n").await?;
+            }
         } else if upper == "DATA" {
             in_data = true;
+            data_overflow = false;
+            raw_data.clear();
             writer
                 .write_all(b"354 End data with <CR><LF>.<CR><LF>\r\n")
                 .await?;
@@ -109,6 +181,7 @@ async fn handle_smtp_client(
             mail_from.clear();
             rcpt_to.clear();
             raw_data.clear();
+            data_overflow = false;
             writer.write_all(b"250 2.0.0 Ok\r\n").await?;
         } else if upper.starts_with("NOOP") {
             writer.write_all(b"250 2.0.0 Ok\r\n").await?;

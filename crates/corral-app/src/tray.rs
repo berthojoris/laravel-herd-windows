@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use corral_core::ports::{ProcessSupervisorPort, RepositoryPort};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -68,47 +70,44 @@ pub fn setup_system_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Erro
                         let _ = w.hide();
                     }
                 }
-                "start_all" => {
+                "start_all" | "restart_all" => {
                     if let Some(state) = app_handle.try_state::<AppStateHandle>() {
-                        if let Ok(guard) = state.lock() {
-                            if let Ok(list) = guard.repo.list_services() {
+                        let svc = state.inner().clone();
+                        std::thread::spawn(move || {
+                            if let Ok(list) = svc.repo.list_services() {
                                 for s in list {
-                                    let _ = guard.supervisor.restart(&s.id);
+                                    let _ = svc.supervisor.restart(&s.id);
                                 }
                             }
-                        }
-                    }
-                }
-                "restart_all" => {
-                    if let Some(state) = app_handle.try_state::<AppStateHandle>() {
-                        if let Ok(guard) = state.lock() {
-                            if let Ok(list) = guard.repo.list_services() {
-                                for s in list {
-                                    let _ = guard.supervisor.restart(&s.id);
-                                }
-                            }
-                        }
+                        });
                     }
                 }
                 "stop_all" => {
                     if let Some(state) = app_handle.try_state::<AppStateHandle>() {
-                        if let Ok(guard) = state.lock() {
-                            if let Ok(list) = guard.repo.list_services() {
+                        let svc = state.inner().clone();
+                        std::thread::spawn(move || {
+                            if let Ok(list) = svc.repo.list_services() {
                                 for s in list {
-                                    let _ = guard.supervisor.stop(&s.id);
+                                    let _ = svc.supervisor.stop(&s.id);
                                 }
                             }
-                        }
+                        });
                     }
                 }
                 "quit" => {
                     if let Some(state) = app_handle.try_state::<AppStateHandle>() {
-                        if let Ok(guard) = state.lock() {
-                            guard.cancel_token.cancel();
-                            guard.supervisor.shutdown_all();
+                        if !state.shutting_down.swap(true, Ordering::SeqCst) {
+                            let svc = state.inner().clone();
+                            let handle = app_handle.clone();
+                            svc.cancel_token.cancel();
+                            std::thread::spawn(move || {
+                                svc.supervisor.shutdown_all();
+                                handle.exit(0);
+                            });
                         }
+                    } else {
+                        app_handle.exit(0);
                     }
-                    app_handle.exit(0);
                 }
                 _ => {}
             }

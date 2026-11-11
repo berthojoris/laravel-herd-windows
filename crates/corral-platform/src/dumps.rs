@@ -1,10 +1,18 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use corral_core::domain::DumpEntry;
 use corral_core::ports::RepositoryPort;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::io::BufReader;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+
+use crate::io_util::{read_bounded_line, BoundedLine};
+
+const MAX_CONCURRENT_DUMP_CLIENTS: usize = 32;
+const MAX_DUMP_LINE_BYTES: usize = 256 * 1024;
+const DUMP_LINE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Spawn a TCP listener on `127.0.0.1:<port>` (default 9912) for Laravel `dump()` / Symfony VarDumper server payloads (MAIL-3).
 /// Runs on its own dedicated thread + Tokio current-thread reactor so it never panics regardless of caller thread context.
@@ -31,6 +39,7 @@ pub fn spawn_dumps_server(
                     return;
                 };
                 tracing::info!("Corral VarDumper Receiver aktif di {addr}");
+                let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DUMP_CLIENTS));
 
                 loop {
                     tokio::select! {
@@ -39,24 +48,17 @@ pub fn spawn_dumps_server(
                         }
                         accept_res = listener.accept() => {
                             if let Ok((stream, _peer)) = accept_res {
+                                let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                                    drop(stream);
+                                    continue;
+                                };
                                 let repo_clone = repo.clone();
+                                let client_cancel = cancel.clone();
                                 tokio::spawn(async move {
-                                    let mut lines = BufReader::new(stream).lines();
-                                    while let Ok(Some(line)) = lines.next_line().await {
-                                        let trimmed = line.trim();
-                                        if trimmed.is_empty() {
-                                            continue;
-                                        }
-                                        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-                                        let entry = DumpEntry {
-                                            id: format!("dump-{}", uuid::Uuid::now_v7()),
-                                            timestamp: now,
-                                            site_name: Some("laravel.test".to_string()),
-                                            file_line: Some("routes/web.php:18".to_string()),
-                                            kind: "VarDumper".to_string(),
-                                            payload: trimmed.to_string(),
-                                        };
-                                        let _ = repo_clone.insert_dump(&entry);
+                                    let _permit = permit;
+                                    tokio::select! {
+                                        _ = client_cancel.cancelled() => {}
+                                        _ = handle_dump_client(stream, repo_clone) => {}
                                     }
                                 });
                             }
@@ -65,4 +67,43 @@ pub fn spawn_dumps_server(
                 }
             });
         });
+}
+
+async fn handle_dump_client(
+    stream: TcpStream,
+    repo: Arc<dyn RepositoryPort>,
+) -> std::io::Result<()> {
+    let mut reader = BufReader::new(stream);
+    loop {
+        let (line, truncated) =
+            match read_bounded_line(&mut reader, MAX_DUMP_LINE_BYTES, DUMP_LINE_TIMEOUT).await? {
+                BoundedLine::Eof => break,
+                BoundedLine::Line(line) => (line, false),
+                BoundedLine::Oversized(prefix) => (prefix, true),
+            };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let entry = DumpEntry {
+            id: format!("dump-{}", uuid::Uuid::now_v7()),
+            timestamp: now,
+            site_name: Some("laravel.test".to_string()),
+            file_line: Some("routes/web.php:18".to_string()),
+            kind: if truncated {
+                "VarDumper (Truncated)".to_string()
+            } else {
+                "VarDumper".to_string()
+            },
+            payload: if truncated {
+                format!("{trimmed}\n...[dipotong oleh Corral karena melebihi batas 256 KB]")
+            } else {
+                trimmed.to_string()
+            },
+        };
+        let repo_for_insert = repo.clone();
+        let _ = tokio::task::spawn_blocking(move || repo_for_insert.insert_dump(&entry)).await;
+    }
+    Ok(())
 }

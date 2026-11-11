@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use corral_core::application::collect_host_entries;
 use corral_core::domain::{AppSettings, Certificate};
@@ -17,23 +18,29 @@ use corral_platform::trust::TlsCertificateManager;
 use tokio_util::sync::CancellationToken;
 
 pub struct AppServices {
-    pub paths: CorralPaths,
-    pub settings: AppSettings,
+    pub paths: Arc<CorralPaths>,
+    pub settings: RwLock<AppSettings>,
+    pub close_to_tray: AtomicBool,
+    pub minimize_to_tray: AtomicBool,
+    pub shutting_down: AtomicBool,
     pub repo: Arc<SqliteRepository>,
     pub supervisor: Arc<ServiceSupervisor>,
     pub php_mgr: Arc<PhpRuntimeManager>,
     pub nginx: Arc<NginxController>,
     pub tls: Arc<TlsCertificateManager>,
     pub hosts: Arc<WindowsHostsManager>,
+    pub routing_lock: Mutex<()>,
     pub cancel_token: CancellationToken,
 }
 
-pub type AppStateHandle = Mutex<AppServices>;
+pub type AppStateHandle = Arc<AppServices>;
 
 impl AppServices {
     pub fn bootstrap() -> Result<Self, AppError> {
-        let paths = CorralPaths::discover()?;
+        let paths = Arc::new(CorralPaths::discover()?);
         let settings = paths.load_settings()?;
+        let close_to_tray = AtomicBool::new(settings.close_to_tray);
+        let minimize_to_tray = AtomicBool::new(settings.minimize_to_tray);
         let repo = Arc::new(SqliteRepository::open(
             &paths.db_path,
             &paths.default_herd_dir,
@@ -81,18 +88,45 @@ impl AppServices {
 
         Ok(Self {
             paths,
-            settings,
+            settings: RwLock::new(settings),
+            close_to_tray,
+            minimize_to_tray,
+            shutting_down: AtomicBool::new(false),
             repo,
             supervisor,
             php_mgr,
             nginx,
             tls,
             hosts,
+            routing_lock: Mutex::new(()),
             cancel_token,
         })
     }
 
+    pub fn read_settings(&self) -> Result<AppSettings, AppError> {
+        let guard = self.settings.read().map_err(|_| AppError::StateLock)?;
+        Ok(guard.clone())
+    }
+
+    pub fn update_settings<F>(&self, mutate: F) -> Result<AppSettings, AppError>
+    where
+        F: FnOnce(&mut AppSettings),
+    {
+        let mut guard = self.settings.write().map_err(|_| AppError::StateLock)?;
+        let mut next = guard.clone();
+        mutate(&mut next);
+        self.paths.save_settings(&next)?;
+        self.close_to_tray
+            .store(next.close_to_tray, Ordering::Relaxed);
+        self.minimize_to_tray
+            .store(next.minimize_to_tray, Ordering::Relaxed);
+        *guard = next.clone();
+        Ok(next)
+    }
+
     pub fn sync_routing(&self) -> Result<(), AppError> {
+        let _routing_guard = self.routing_lock.lock().map_err(|_| AppError::StateLock)?;
+        let settings = self.read_settings()?;
         let sites = self.repo.list_sites()?;
         let workspaces = self.repo.list_workspaces(None)?;
         let mut cert_map: HashMap<String, Certificate> = HashMap::new();
@@ -103,7 +137,7 @@ impl AppServices {
                 }
             }
         }
-        self.nginx.sync_all_sites(&sites, &self.settings, &cert_map)?;
+        self.nginx.sync_all_sites(&sites, &settings, &cert_map)?;
         let entries = collect_host_entries(&sites, &workspaces);
         self.hosts.replace_block(&entries)?;
         Ok(())

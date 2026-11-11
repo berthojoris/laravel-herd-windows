@@ -289,6 +289,8 @@ impl CorralProjectConfig {
 pub struct AppSettings {
     pub theme: String,
     pub default_php_version: String,
+    #[serde(default)]
+    pub php_paths: std::collections::BTreeMap<String, PathBuf>,
     pub default_node_version: String,
     pub default_tld: String,
     pub http_port: u16,
@@ -317,6 +319,7 @@ impl Default for AppSettings {
         Self {
             theme: "system".to_string(),
             default_php_version: "8.4".to_string(),
+            php_paths: std::collections::BTreeMap::new(),
             default_node_version: "22".to_string(),
             default_tld: "test".to_string(),
             http_port: 80,

@@ -2,15 +2,19 @@ pub mod commands;
 pub mod state;
 pub mod tray;
 
-use std::sync::Mutex;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use state::{AppServices, AppStateHandle};
 use tauri::{Manager, WindowEvent};
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let services = AppServices::bootstrap()?;
-    let start_minimized = services.settings.start_minimized;
-    let state_handle: AppStateHandle = Mutex::new(services);
+    let start_minimized = services
+        .read_settings()
+        .map(|s| s.start_minimized)
+        .unwrap_or(false);
+    let state_handle: AppStateHandle = Arc::new(services);
 
     tauri::Builder::default()
         .manage(state_handle)
@@ -25,34 +29,36 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .on_window_event(|window, event| match event {
             WindowEvent::CloseRequested { api, .. } => {
-                let mut should_hide_to_tray = false;
                 if let Some(state) = window.app_handle().try_state::<AppStateHandle>() {
-                    if let Ok(guard) = state.lock() {
-                        should_hide_to_tray = guard.settings.close_to_tray;
-                        if !should_hide_to_tray {
-                            guard.cancel_token.cancel();
-                            guard.supervisor.shutdown_all();
-                        }
+                    if state.shutting_down.load(Ordering::SeqCst) {
+                        return;
                     }
-                }
-                if should_hide_to_tray {
+                    if state.close_to_tray.load(Ordering::Relaxed) {
+                        api.prevent_close();
+                        let _ = window.hide();
+                        return;
+                    }
                     api.prevent_close();
                     let _ = window.hide();
+                    if !state.shutting_down.swap(true, Ordering::SeqCst) {
+                        let svc = state.inner().clone();
+                        let app_handle = window.app_handle().clone();
+                        svc.cancel_token.cancel();
+                        std::thread::spawn(move || {
+                            svc.supervisor.shutdown_all();
+                            app_handle.exit(0);
+                        });
+                    }
                 } else {
-                    let app_handle = window.app_handle().clone();
-                    app_handle.exit(0);
+                    window.app_handle().exit(0);
                 }
             }
             WindowEvent::Resized(_) => {
                 if window.is_minimized().unwrap_or(false) {
-                    let mut min_to_tray = false;
                     if let Some(state) = window.app_handle().try_state::<AppStateHandle>() {
-                        if let Ok(guard) = state.lock() {
-                            min_to_tray = guard.settings.minimize_to_tray;
+                        if state.minimize_to_tray.load(Ordering::Relaxed) {
+                            let _ = window.hide();
                         }
-                    }
-                    if min_to_tray {
-                        let _ = window.hide();
                     }
                 }
             }
@@ -165,6 +171,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use crate::commands::{read_log_lines_inner, validate_allowed_log_path};
     use crate::state::AppServices;
     use corral_core::ports::RepositoryPort;
 
@@ -174,6 +181,17 @@ mod tests {
         let sites = svc.repo.list_sites().unwrap();
         assert!(!sites.is_empty());
         assert!(svc.sync_routing().is_ok());
+
+        let corral_log = svc.paths.logs_dir.join("corral.log");
+        let corral_log_str = corral_log.to_string_lossy().to_string();
+        assert!(validate_allowed_log_path(&svc, &corral_log_str).is_ok());
+        assert!(read_log_lines_inner(&svc, &corral_log_str).is_ok());
+
+        assert!(validate_allowed_log_path(&svc, r"C:\Windows\WindowsUpdate.log").is_err());
+        assert!(validate_allowed_log_path(&svc, r"C:\Windows\win.ini").is_err());
+        let traversal = format!("{}\\..\\..\\Windows\\Temp\\evil.log", svc.paths.logs_dir.display());
+        assert!(validate_allowed_log_path(&svc, &traversal).is_err());
+
         svc.cancel_token.cancel();
         svc.supervisor.shutdown_all();
     }

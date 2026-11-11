@@ -1,14 +1,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use corral_core::domain::{
     DumpEntry, Framework, MailAttachment, MailMessage, ServiceInstance, ServiceKind, ServiceState,
     Site, WorkerKind, Workspace,
 };
-use corral_core::dto::DatabaseView;
+use corral_core::dto::{DatabaseView, MailSummaryView};
 use corral_core::error::AppError;
 use corral_core::ports::RepositoryPort;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
+
+const MAX_STORED_MAILS: i64 = 500;
+const MAX_STORED_DUMPS: i64 = 500;
 
 pub struct SqliteRepository {
     conn: Mutex<Connection>,
@@ -21,6 +25,8 @@ impl SqliteRepository {
         }
         let conn = Connection::open(db_path)
             .map_err(|e| AppError::Io(format!("gagal membuka SQLite {}: {e}", db_path.display())))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|e| AppError::Io(format!("gagal mengatur SQLite busy_timeout: {e}")))?;
 
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -110,7 +116,11 @@ impl SqliteRepository {
                  tables_count INTEGER NOT NULL DEFAULT 12,
                  size_kb INTEGER NOT NULL DEFAULT 2048,
                  linked_site TEXT
-             );",
+             );
+
+             CREATE INDEX IF NOT EXISTS idx_hosts_site_id ON hosts(site_id);
+             CREATE INDEX IF NOT EXISTS idx_mails_received_at ON mails(received_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_dumps_timestamp ON dumps(timestamp DESC);",
         )
         .map_err(|e| AppError::Io(format!("gagal migrasi skema SQLite: {e}")))?;
 
@@ -121,9 +131,16 @@ impl SqliteRepository {
         Ok(repo)
     }
 
+    fn has_rows_query(&self, exists_sql: &'static str) -> Result<bool, AppError> {
+        let guard = self.conn.lock().map_err(|_| AppError::StateLock)?;
+        let exists: i32 = guard
+            .query_row(exists_sql, [], |row| row.get(0))
+            .map_err(|e| AppError::Io(e.to_string()))?;
+        Ok(exists != 0)
+    }
+
     fn seed_if_empty(&self, default_herd_dir: &Path) -> Result<(), AppError> {
-        let existing_services = self.list_services()?;
-        if existing_services.is_empty() {
+        if !self.has_rows_query("SELECT EXISTS(SELECT 1 FROM services LIMIT 1)")? {
             let defaults = vec![
                 ServiceInstance {
                     id: "svc-nginx".to_string(),
@@ -227,8 +244,7 @@ impl SqliteRepository {
             }
         }
 
-        let existing_sites = self.list_sites()?;
-        if existing_sites.is_empty() {
+        if !self.has_rows_query("SELECT EXISTS(SELECT 1 FROM sites LIMIT 1)")? {
             // Create two realistic Laravel project skeletons inside default_herd_dir so files exist on disk
             let app1_path = default_herd_dir.join("laravel-commerce");
             let app2_path = default_herd_dir.join("filament-crm");
@@ -301,8 +317,7 @@ impl SqliteRepository {
             self.upsert_database("laravel_commerce_checkout", "MariaDB 11.4", 3306, 28, 3150, Some("feature-checkout-v2.laravel-commerce.test"))?;
         }
 
-        let existing_mails = self.list_mails()?;
-        if existing_mails.is_empty() {
+        if !self.has_rows_query("SELECT EXISTS(SELECT 1 FROM mails LIMIT 1)")? {
             let demo_mails = vec![
                 MailMessage {
                     id: "mail-1".to_string(),
@@ -340,8 +355,7 @@ impl SqliteRepository {
             }
         }
 
-        let existing_dumps = self.list_dumps()?;
-        if existing_dumps.is_empty() {
+        if !self.has_rows_query("SELECT EXISTS(SELECT 1 FROM dumps LIMIT 1)")? {
             let demo_dumps = vec![
                 DumpEntry {
                     id: "dump-1".to_string(),
@@ -506,7 +520,7 @@ impl RepositoryPort for SqliteRepository {
     fn list_sites(&self) -> Result<Vec<Site>, AppError> {
         let guard = self.conn.lock().map_err(|_| AppError::StateLock)?;
         let mut stmt = guard
-            .prepare(
+            .prepare_cached(
                 "SELECT id, name, path, document_root, php_version, node_version, https,
                         framework_json, db_name, proxy_target, workers_json,
                         opcache_enabled, xdebug_enabled, created_at
@@ -515,102 +529,41 @@ impl RepositoryPort for SqliteRepository {
             .map_err(|e| AppError::Io(e.to_string()))?;
 
         let site_rows = stmt
-            .query_map([], |row| {
-                let id: String = row.get(0)?;
-                let name: String = row.get(1)?;
-                let path_str: String = row.get(2)?;
-                let doc_root_str: Option<String> = row.get(3)?;
-                let php_version: Option<String> = row.get(4)?;
-                let node_version: Option<String> = row.get(5)?;
-                let https_int: i32 = row.get(6)?;
-                let fw_json: String = row.get(7)?;
-                let db_name: Option<String> = row.get(8)?;
-                let proxy_target: Option<String> = row.get(9)?;
-                let workers_json: String = row.get(10)?;
-                let opcache_int: i32 = row.get(11)?;
-                let xdebug_int: i32 = row.get(12)?;
-                let created_at: i64 = row.get(13)?;
-                Ok((
-                    id,
-                    name,
-                    path_str,
-                    doc_root_str,
-                    php_version,
-                    node_version,
-                    https_int != 0,
-                    fw_json,
-                    db_name,
-                    proxy_target,
-                    workers_json,
-                    opcache_int != 0,
-                    xdebug_int != 0,
-                    created_at,
-                ))
-            })
+            .query_map([], map_raw_site_tuple)
             .map_err(|e| AppError::Io(e.to_string()))?;
 
         let mut sites = Vec::new();
         for row_res in site_rows {
-            let (
-                id,
-                name,
-                path_str,
-                doc_root_str,
-                php_version,
-                node_version,
-                https,
-                fw_json,
-                db_name,
-                proxy_target,
-                workers_json,
-                opcache_enabled,
-                xdebug_enabled,
-                created_at,
-            ) = row_res.map_err(|e| AppError::Io(e.to_string()))?;
-
-            let mut host_stmt = guard
-                .prepare("SELECT host FROM hosts WHERE site_id = ?1 ORDER BY host ASC")
-                .map_err(|e| AppError::Io(e.to_string()))?;
-            let host_rows = host_stmt
-                .query_map(params![&id], |r| r.get::<_, String>(0))
-                .map_err(|e| AppError::Io(e.to_string()))?;
-            let mut hostnames = Vec::new();
-            for h in host_rows {
-                hostnames.push(h.map_err(|e| AppError::Io(e.to_string()))?);
-            }
-            if hostnames.is_empty() {
-                hostnames.push(format!("{name}.test"));
-            }
-
-            let framework: Framework =
-                serde_json::from_str(&fw_json).unwrap_or(Framework::PlainPhp);
-            let workers: Vec<WorkerKind> = serde_json::from_str(&workers_json).unwrap_or_default();
-
-            sites.push(Site {
-                id,
-                name,
-                path: PathBuf::from(path_str),
-                document_root: doc_root_str.map(PathBuf::from),
-                hostnames,
-                php_version,
-                node_version,
-                https,
-                isolated_services: Vec::new(),
-                workers,
-                framework,
-                db_name,
-                proxy_target,
-                opcache_enabled,
-                xdebug_enabled,
-                created_at,
-            });
+            let raw = row_res.map_err(|e| AppError::Io(e.to_string()))?;
+            let hostnames = load_site_hostnames(&guard, &raw.0, &raw.1)?;
+            sites.push(build_site_from_raw(raw, hostnames));
         }
         Ok(sites)
     }
 
     fn get_site(&self, id: &str) -> Result<Option<Site>, AppError> {
-        let all = self.list_sites()?;
-        Ok(all.into_iter().find(|s| s.id == id || s.name == id))
+        let guard = self.conn.lock().map_err(|_| AppError::StateLock)?;
+        let mut stmt = guard
+            .prepare_cached(
+                "SELECT id, name, path, document_root, php_version, node_version, https,
+                        framework_json, db_name, proxy_target, workers_json,
+                        opcache_enabled, xdebug_enabled, created_at
+                 FROM sites
+                 WHERE id = ?1 OR name = ?1
+                 LIMIT 1",
+            )
+            .map_err(|e| AppError::Io(e.to_string()))?;
+
+        let maybe_raw = stmt
+            .query_row(params![id], map_raw_site_tuple)
+            .optional()
+            .map_err(|e| AppError::Io(e.to_string()))?;
+
+        let Some(raw) = maybe_raw else {
+            return Ok(None);
+        };
+        let hostnames = load_site_hostnames(&guard, &raw.0, &raw.1)?;
+        Ok(Some(build_site_from_raw(raw, hostnames)))
     }
 
     fn upsert_site(&self, site: &Site) -> Result<(), AppError> {
@@ -690,7 +643,7 @@ impl RepositoryPort for SqliteRepository {
     fn list_services(&self) -> Result<Vec<ServiceInstance>, AppError> {
         let guard = self.conn.lock().map_err(|_| AppError::StateLock)?;
         let mut stmt = guard
-            .prepare(
+            .prepare_cached(
                 "SELECT id, name, kind_json, version, port, data_dir, autostart, site_id
                  FROM services ORDER BY port ASC",
             )
@@ -779,9 +732,29 @@ impl RepositoryPort for SqliteRepository {
     fn list_mails(&self) -> Result<Vec<MailMessage>, AppError> {
         let guard = self.conn.lock().map_err(|_| AppError::StateLock)?;
         let mut stmt = guard
-            .prepare(
+            .prepare_cached(
                 "SELECT id, received_at, envelope_from, recipients_json, subject, preview,
                         html_body, text_body, raw_headers, attachments_json, read_flag
+                 FROM mails ORDER BY received_at DESC LIMIT 200",
+            )
+            .map_err(|e| AppError::Io(e.to_string()))?;
+        let rows = stmt
+            .query_map([], map_mail_row)
+            .map_err(|e| AppError::Io(e.to_string()))?;
+
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r.map_err(|e| AppError::Io(e.to_string()))?);
+        }
+        Ok(list)
+    }
+
+    fn list_mail_summaries(&self) -> Result<Vec<MailSummaryView>, AppError> {
+        let guard = self.conn.lock().map_err(|_| AppError::StateLock)?;
+        let mut stmt = guard
+            .prepare_cached(
+                "SELECT id, received_at, envelope_from, recipients_json, subject, preview,
+                        attachments_json, read_flag
                  FROM mails ORDER BY received_at DESC LIMIT 200",
             )
             .map_err(|e| AppError::Io(e.to_string()))?;
@@ -793,66 +766,64 @@ impl RepositoryPort for SqliteRepository {
                 let recipients_json: String = row.get(3)?;
                 let subject: String = row.get(4)?;
                 let preview: String = row.get(5)?;
-                let html_body: String = row.get(6)?;
-                let text_body: String = row.get(7)?;
-                let raw_headers: String = row.get(8)?;
-                let attachments_json: String = row.get(9)?;
-                let read_int: i32 = row.get(10)?;
-                Ok((
+                let attachments_json: String = row.get(6)?;
+                let read_int: i32 = row.get(7)?;
+                let recipients: Vec<String> =
+                    serde_json::from_str(&recipients_json).unwrap_or_default();
+                let attachments: Vec<MailAttachment> =
+                    serde_json::from_str(&attachments_json).unwrap_or_default();
+                let has_attachments = !attachments.is_empty();
+                Ok(MailSummaryView {
                     id,
                     received_at,
                     envelope_from,
-                    recipients_json,
+                    recipients,
                     subject,
                     preview,
-                    html_body,
-                    text_body,
-                    raw_headers,
-                    attachments_json,
-                    read_int != 0,
-                ))
+                    attachments,
+                    has_attachments,
+                    read: read_int != 0,
+                })
             })
             .map_err(|e| AppError::Io(e.to_string()))?;
 
         let mut list = Vec::new();
         for r in rows {
-            let (
-                id,
-                received_at,
-                envelope_from,
-                recipients_json,
-                subject,
-                preview,
-                html_body,
-                text_body,
-                raw_headers,
-                attachments_json,
-                read,
-            ) = r.map_err(|e| AppError::Io(e.to_string()))?;
-            let recipients: Vec<String> =
-                serde_json::from_str(&recipients_json).unwrap_or_default();
-            let attachments: Vec<MailAttachment> =
-                serde_json::from_str(&attachments_json).unwrap_or_default();
-            list.push(MailMessage {
-                id,
-                received_at,
-                envelope_from,
-                recipients,
-                subject,
-                preview,
-                html_body,
-                text_body,
-                raw_headers,
-                attachments,
-                read,
-            });
+            list.push(r.map_err(|e| AppError::Io(e.to_string()))?);
         }
         Ok(list)
     }
 
+    fn count_mails(&self) -> Result<(usize, usize), AppError> {
+        let guard = self.conn.lock().map_err(|_| AppError::StateLock)?;
+        let mut stmt = guard
+            .prepare_cached(
+                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN read_flag = 0 THEN 1 ELSE 0 END), 0)
+                 FROM mails",
+            )
+            .map_err(|e| AppError::Io(e.to_string()))?;
+        let (total_i64, unread_i64): (i64, i64) = stmt
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| AppError::Io(e.to_string()))?;
+        let total = usize::try_from(total_i64.max(0)).unwrap_or(0);
+        let unread = usize::try_from(unread_i64.max(0)).unwrap_or(0);
+        Ok((total, unread))
+    }
+
     fn get_mail(&self, id: &str) -> Result<Option<MailMessage>, AppError> {
-        let all = self.list_mails()?;
-        Ok(all.into_iter().find(|m| m.id == id))
+        let guard = self.conn.lock().map_err(|_| AppError::StateLock)?;
+        let mut stmt = guard
+            .prepare_cached(
+                "SELECT id, received_at, envelope_from, recipients_json, subject, preview,
+                        html_body, text_body, raw_headers, attachments_json, read_flag
+                 FROM mails
+                 WHERE id = ?1
+                 LIMIT 1",
+            )
+            .map_err(|e| AppError::Io(e.to_string()))?;
+        stmt.query_row(params![id], map_mail_row)
+            .optional()
+            .map_err(|e| AppError::Io(e.to_string()))
     }
 
     fn insert_mail(&self, mail: &MailMessage) -> Result<(), AppError> {
@@ -880,6 +851,14 @@ impl RepositoryPort for SqliteRepository {
                 ],
             )
             .map_err(|e| AppError::Io(e.to_string()))?;
+
+        // Ring-buffer pruning: keep at most MAX_STORED_MAILS latest emails so SQLite stays bounded.
+        let _ = guard.execute(
+            "DELETE FROM mails WHERE id NOT IN (
+                 SELECT id FROM mails ORDER BY received_at DESC, id DESC LIMIT ?1
+             )",
+            params![MAX_STORED_MAILS],
+        );
         Ok(())
     }
 
@@ -913,7 +892,7 @@ impl RepositoryPort for SqliteRepository {
     fn list_dumps(&self) -> Result<Vec<DumpEntry>, AppError> {
         let guard = self.conn.lock().map_err(|_| AppError::StateLock)?;
         let mut stmt = guard
-            .prepare(
+            .prepare_cached(
                 "SELECT id, timestamp, site_name, file_line, kind, payload
                  FROM dumps ORDER BY timestamp DESC LIMIT 200",
             )
@@ -953,6 +932,14 @@ impl RepositoryPort for SqliteRepository {
                 ],
             )
             .map_err(|e| AppError::Io(e.to_string()))?;
+
+        // Ring-buffer pruning: keep at most MAX_STORED_DUMPS latest dump entries.
+        let _ = guard.execute(
+            "DELETE FROM dumps WHERE id NOT IN (
+                 SELECT id FROM dumps ORDER BY timestamp DESC, id DESC LIMIT ?1
+             )",
+            params![MAX_STORED_DUMPS],
+        );
         Ok(())
     }
 
@@ -967,7 +954,7 @@ impl RepositoryPort for SqliteRepository {
     fn list_workspaces(&self, site_id: Option<&str>) -> Result<Vec<Workspace>, AppError> {
         let guard = self.conn.lock().map_err(|_| AppError::StateLock)?;
         let mut stmt = guard
-            .prepare(
+            .prepare_cached(
                 "SELECT id, site_id, site_name, branch, path, host, db_name, created_at
                  FROM workspaces ORDER BY created_at DESC",
             )
@@ -1029,4 +1016,145 @@ impl RepositoryPort for SqliteRepository {
             .map_err(|e| AppError::Io(e.to_string()))?;
         Ok(())
     }
+}
+
+type RawSiteTuple = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    bool,
+    bool,
+    i64,
+);
+
+fn map_raw_site_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawSiteTuple> {
+    let id: String = row.get(0)?;
+    let name: String = row.get(1)?;
+    let path_str: String = row.get(2)?;
+    let doc_root_str: Option<String> = row.get(3)?;
+    let php_version: Option<String> = row.get(4)?;
+    let node_version: Option<String> = row.get(5)?;
+    let https_int: i32 = row.get(6)?;
+    let fw_json: String = row.get(7)?;
+    let db_name: Option<String> = row.get(8)?;
+    let proxy_target: Option<String> = row.get(9)?;
+    let workers_json: String = row.get(10)?;
+    let opcache_int: i32 = row.get(11)?;
+    let xdebug_int: i32 = row.get(12)?;
+    let created_at: i64 = row.get(13)?;
+    Ok((
+        id,
+        name,
+        path_str,
+        doc_root_str,
+        php_version,
+        node_version,
+        https_int != 0,
+        fw_json,
+        db_name,
+        proxy_target,
+        workers_json,
+        opcache_int != 0,
+        xdebug_int != 0,
+        created_at,
+    ))
+}
+
+fn load_site_hostnames(
+    conn: &Connection,
+    site_id: &str,
+    site_name: &str,
+) -> Result<Vec<String>, AppError> {
+    let mut host_stmt = conn
+        .prepare_cached("SELECT host FROM hosts WHERE site_id = ?1 ORDER BY host ASC")
+        .map_err(|e| AppError::Io(e.to_string()))?;
+    let host_rows = host_stmt
+        .query_map(params![site_id], |r| r.get::<_, String>(0))
+        .map_err(|e| AppError::Io(e.to_string()))?;
+    let mut hostnames = Vec::new();
+    for h in host_rows {
+        hostnames.push(h.map_err(|e| AppError::Io(e.to_string()))?);
+    }
+    if hostnames.is_empty() {
+        hostnames.push(format!("{site_name}.test"));
+    }
+    Ok(hostnames)
+}
+
+fn build_site_from_raw(raw: RawSiteTuple, hostnames: Vec<String>) -> Site {
+    let (
+        id,
+        name,
+        path_str,
+        doc_root_str,
+        php_version,
+        node_version,
+        https,
+        fw_json,
+        db_name,
+        proxy_target,
+        workers_json,
+        opcache_enabled,
+        xdebug_enabled,
+        created_at,
+    ) = raw;
+    let framework: Framework = serde_json::from_str(&fw_json).unwrap_or(Framework::PlainPhp);
+    let workers: Vec<WorkerKind> = serde_json::from_str(&workers_json).unwrap_or_default();
+
+    Site {
+        id,
+        name,
+        path: PathBuf::from(path_str),
+        document_root: doc_root_str.map(PathBuf::from),
+        hostnames,
+        php_version,
+        node_version,
+        https,
+        isolated_services: Vec::new(),
+        workers,
+        framework,
+        db_name,
+        proxy_target,
+        opcache_enabled,
+        xdebug_enabled,
+        created_at,
+    }
+}
+
+fn map_mail_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MailMessage> {
+    let id: String = row.get(0)?;
+    let received_at: i64 = row.get(1)?;
+    let envelope_from: String = row.get(2)?;
+    let recipients_json: String = row.get(3)?;
+    let subject: String = row.get(4)?;
+    let preview: String = row.get(5)?;
+    let html_body: String = row.get(6)?;
+    let text_body: String = row.get(7)?;
+    let raw_headers: String = row.get(8)?;
+    let attachments_json: String = row.get(9)?;
+    let read_int: i32 = row.get(10)?;
+    let recipients: Vec<String> = serde_json::from_str(&recipients_json).unwrap_or_default();
+    let attachments: Vec<MailAttachment> =
+        serde_json::from_str(&attachments_json).unwrap_or_default();
+    Ok(MailMessage {
+        id,
+        received_at,
+        envelope_from,
+        recipients,
+        subject,
+        preview,
+        html_body,
+        text_body,
+        raw_headers,
+        attachments,
+        read: read_int != 0,
+    })
 }

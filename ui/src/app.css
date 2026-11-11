@@ -580,21 +580,18 @@ textarea:focus-visible {
   color: var(--text-secondary);
 }
 
-.toast-bar {
-  position: fixed;
-  bottom: 16px;
-  right: 16px;
-  z-index: 9999;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 14px;
-  border-radius: 8px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border-strong);
-  color: var(--text-primary);
-  max-width: 440px;
-}
+.notification-backdrop { z-index: 10000; }
+.notification-card { max-height: 85vh; overflow: auto; }
+.notification-heading { display: flex; align-items: center; gap: 10px; }
+.notification-heading h3 { margin: 0; font-size: 15px; }
+.notification-icon { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; flex: none; border: 1px solid currentColor; border-radius: 50%; color: var(--success); font-weight: 700; }
+.notification-icon.error { color: var(--danger); }
+.notification-icon.info { color: var(--text-secondary); }
+.notification-card p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
+.notification-actions { display: flex; justify-content: flex-end; }
+button[data-pending="true"]::before { content: ''; display: inline-block; flex: none; width: 12px; height: 12px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: button-spin .7s linear infinite; }
+@keyframes button-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { button[data-pending="true"]::before { animation-duration: 1.5s; } }
 
 .modal-backdrop {
   position: fixed;

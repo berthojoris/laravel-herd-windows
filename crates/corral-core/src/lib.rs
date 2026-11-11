@@ -194,4 +194,23 @@ workers:
         assert!(!clean.contains("<script>"));
         assert!(!clean.contains("onerror="));
     }
+
+    #[test]
+    fn test_sanitize_email_html_mixed_case_utf8_and_large_input() {
+        let mixed = "<p>Halo 🚀 Dunia</p><ScRiPt type=\"text/javascript\">evil()</sCrIpT   ><a href=\"JaVaScRiPt:evil()\" OnClIcK=\"boom()\">Klik</a><SCRIPT>unclosed";
+        let clean = sanitize_email_html(mixed);
+        assert!(clean.contains("Halo 🚀 Dunia"));
+        assert!(!clean.to_ascii_lowercase().contains("<script"));
+        assert!(!clean.to_ascii_lowercase().contains("javascript:"));
+        assert!(!clean.to_ascii_lowercase().contains("onclick="));
+        assert!(!clean.contains("unclosed"));
+
+        let repeated = "<p>Baris aman dengan karakter UTF-8 ✓</p><SCRIPT>x()</SCRIPT>".repeat(4000);
+        let clean_large = sanitize_email_html(&repeated);
+        assert!(!clean_large.to_ascii_lowercase().contains("<script"));
+        assert_eq!(
+            clean_large.matches("Baris aman dengan karakter UTF-8 ✓").count(),
+            4000
+        );
+    }
 }

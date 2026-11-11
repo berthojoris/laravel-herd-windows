@@ -165,6 +165,18 @@ export interface MailMessage {
   read: boolean;
 }
 
+export interface MailSummaryView {
+  id: string;
+  receivedAt: number;
+  envelopeFrom: string;
+  recipients: string[];
+  subject: string;
+  preview: string;
+  attachments: MailAttachment[];
+  hasAttachments: boolean;
+  read: boolean;
+}
+
 export interface MailSettingsView {
   smtpHost: string;
   smtpPort: number;
@@ -263,6 +275,7 @@ export interface ArtisanOutputDto {
 export interface AppSettingsDto {
   theme: string;
   defaultPhpVersion: string;
+  phpPaths: Record<string, string>;
   defaultNodeVersion: string;
   defaultTld: string;
   httpPort: number;

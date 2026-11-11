@@ -16,6 +16,7 @@
     type LogLine,
     type MailMessage,
     type MailSettingsView,
+    type MailSummaryView,
     type NodeVersionView,
     type PhpIniSettingsDto,
     type PhpVersionView,
@@ -36,8 +37,7 @@
   let serviceSubTab = $state<ServiceSubTab>('daemons');
 
   let loading = $state<boolean>(true);
-  let toastMessage = $state<string | null>(null);
-  let toastKind = $state<'info' | 'error' | 'success'>('info');
+  let notifications = $state<{ message: string; kind: 'info' | 'error' | 'success' }[]>([]);
 
   let appInfo = $state<AppInfoView | null>(null);
   let settings = $state<AppSettingsDto | null>(null);
@@ -55,9 +55,11 @@
   let dbCredentials = $state<DbCredentialsView | null>(null);
   let newDbName = $state<string>('');
 
-  let mails = $state<MailMessage[]>([]);
+  let mails = $state<MailSummaryView[]>([]);
   let mailSettings = $state<MailSettingsView | null>(null);
   let selectedMailId = $state<string>('');
+  let selectedMailDetail = $state<MailMessage | null>(null);
+  let loadingMailDetail = $state<boolean>(false);
   let mailPreviewMode = $state<'html' | 'text' | 'headers'>('html');
 
   let dumps = $state<DumpEntry[]>([]);
@@ -84,6 +86,8 @@
   let newSiteName = $state<string>('');
   let newSitePhp = $state<string>('8.4');
   let newSiteHttps = $state<boolean>(true);
+  let newSiteTemplate = $state<string>('laravel');
+  let creatingSite = $state<boolean>(false);
 
   let showLinkFolderModal = $state<boolean>(false);
   let linkFolderPath = $state<string>('');
@@ -148,14 +152,43 @@
     }),
   );
 
+  const MAX_NOTIFICATIONS = 5;
+
   function notify(msg: string, kind: 'info' | 'error' | 'success' = 'success') {
-    toastMessage = msg;
-    toastKind = kind;
-    setTimeout(() => {
-      if (toastMessage === msg) {
-        toastMessage = null;
-      }
-    }, 3800);
+    const last = notifications[notifications.length - 1];
+    if (last && last.message === msg && last.kind === kind) {
+      return;
+    }
+    const next = [...notifications, { message: msg, kind }];
+    notifications =
+      next.length > MAX_NOTIFICATIONS ? next.slice(next.length - MAX_NOTIFICATIONS) : next;
+  }
+
+  function focusNotification(node: HTMLElement) {
+    const previous = document.activeElement as HTMLElement | null;
+    requestAnimationFrame(() => node.querySelector<HTMLButtonElement>('button')?.focus());
+    return { destroy: () => { if (previous?.isConnected) previous.focus(); } };
+  }
+
+  function dismissNotification() {
+    notifications = notifications.slice(1);
+  }
+
+  async function runButton(event: MouseEvent, action: () => unknown) {
+    const button = event.currentTarget as HTMLButtonElement;
+    if (button.dataset.pending) return;
+    button.dataset.pending = 'true';
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    try {
+      await action();
+    } catch (error) {
+      notify(messageFor(parseAppError(error)), 'error');
+    } finally {
+      delete button.dataset.pending;
+      button.removeAttribute('aria-busy');
+      if (button.isConnected) button.disabled = false;
+    }
   }
 
   function applyThemeToDocument(themePref: string) {
@@ -169,7 +202,47 @@
     }
   }
 
-  async function refreshAll() {
+  let refreshPromise: Promise<void> | null = null;
+
+  async function selectMail(id: string) {
+    selectedMailId = id;
+    if (!id) {
+      selectedMailDetail = null;
+      return;
+    }
+    loadingMailDetail = true;
+    try {
+      const detail = await call<MailMessage>('get_mail', { id });
+      if (selectedMailId === id) {
+        selectedMailDetail = detail;
+      }
+      const idx = mails.findIndex((m) => m.id === id);
+      if (idx !== -1 && !mails[idx].read) {
+        mails[idx] = { ...mails[idx], read: true };
+        if (mailSettings && mailSettings.unreadCount > 0) {
+          mailSettings = { ...mailSettings, unreadCount: mailSettings.unreadCount - 1 };
+        }
+      }
+    } catch (e) {
+      notify(messageFor(parseAppError(e)), 'error');
+    } finally {
+      if (selectedMailId === id) {
+        loadingMailDetail = false;
+      }
+    }
+  }
+
+  async function refreshAll(): Promise<void> {
+    if (refreshPromise) {
+      return refreshPromise;
+    }
+    refreshPromise = performRefreshAll().finally(() => {
+      refreshPromise = null;
+    });
+    return refreshPromise;
+  }
+
+  async function performRefreshAll() {
     try {
       const [
         infoRes,
@@ -194,7 +267,7 @@
         call<ServiceView[]>('list_services'),
         call<PhpVersionView[]>('list_php_versions'),
         call<NodeVersionView[]>('list_node_versions'),
-        call<MailMessage[]>('list_mails'),
+        call<MailSummaryView[]>('list_mails'),
         call<MailSettingsView>('mail_settings'),
         call<DumpEntry[]>('list_dumps'),
         call<LogFileView[]>('list_log_files'),
@@ -216,8 +289,12 @@
       phpVersions = phpRes;
       nodeVersions = nodeRes;
       mails = mailsRes;
-      if (!selectedMailId && mailsRes.length > 0) {
+      if (mailsRes.length === 0) {
+        selectedMailId = '';
+        selectedMailDetail = null;
+      } else if (!selectedMailId || !mailsRes.some((m) => m.id === selectedMailId)) {
         selectedMailId = mailsRes[0]?.id ?? '';
+        selectedMailDetail = null;
       }
       mailSettings = mailSetRes;
       dumps = dumpsRes;
@@ -234,8 +311,15 @@
       if (selectedSiteId) {
         await loadSiteExtras(selectedSiteId);
       }
-      if (selectedLogPath) {
+      if (activeTab === 'logs' && selectedLogPath) {
         await loadLogContent(selectedLogPath);
+      }
+      if (
+        activeTab === 'mail' &&
+        selectedMailId &&
+        (!selectedMailDetail || selectedMailDetail.id !== selectedMailId)
+      ) {
+        await selectMail(selectedMailId);
       }
     } catch (e) {
       const err = parseAppError(e);
@@ -265,24 +349,29 @@
   }
 
   async function handleCreateSite() {
+    if (creatingSite) return;
     if (!newSiteName.trim()) {
       notify('Nama proyek Laravel wajib diisi', 'error');
       return;
     }
+    creatingSite = true;
     try {
       const created = await call<SiteView>('create_site', {
         name: newSiteName.trim(),
         phpVersion: newSitePhp,
         https: newSiteHttps,
+        template: newSiteTemplate,
       });
       showNewSiteModal = false;
       newSiteName = '';
       await refreshAll();
       selectedSiteId = created.id;
       await loadSiteExtras(created.id);
-      notify(`Situs Laravel ${created.host} berhasil dibuat dan dioptimasi!`);
+      notify(`Situs Laravel ${created.host} berhasil dibuat!`);
     } catch (e) {
       notify(messageFor(parseAppError(e)), 'error');
+    } finally {
+      creatingSite = false;
     }
   }
 
@@ -507,8 +596,9 @@
   async function handleSendTestMail() {
     try {
       const m = await call<MailMessage>('send_test_mail');
-      await refreshAll();
       selectedMailId = m.id;
+      selectedMailDetail = m;
+      await refreshAll();
       notify('Email uji Laravel berhasil ditangkap oleh Corral SMTP (:1025)!');
     } catch (e) {
       notify(messageFor(parseAppError(e)), 'error');
@@ -519,6 +609,7 @@
     try {
       await call<void>('clear_mails');
       selectedMailId = '';
+      selectedMailDetail = null;
       await refreshAll();
       notify('Semua email di Mail Catcher dibersihkan');
     } catch (e) {
@@ -641,15 +732,15 @@
         </label>
       {/if}
 
-      <button class="btn btn-sm" onclick={() => handleStartOrStopAll(true)} title="Start All Services">
+      <button class="btn btn-sm" onclick={(event) => runButton(event, () => (() => handleStartOrStopAll(true))())} title="Start All Services">
         ● Start All
       </button>
-      <button class="btn btn-sm" onclick={() => refreshAll()} title="Reload Status">
+      <button class="btn btn-sm" onclick={(event) => runButton(event, () => (() => refreshAll())())} title="Reload Status">
         ⟳ Reload
       </button>
       <button
         class="btn btn-sm"
-        onclick={handleMinimizeToTrayNow}
+        onclick={(event) => runButton(event, () => (handleMinimizeToTrayNow)())}
         title="Sembunyikan jendela ke System Tray Windows (Server tetap berjalan di background)"
       >
         ▾ Minimize to Tray
@@ -674,10 +765,10 @@
 
         <button
           class="nav-btn {activeTab === 'services' ? 'active' : ''}"
-          onclick={() => {
+          onclick={(event) => runButton(event, () => (() => {
             activeTab = 'services';
-            if (!phpIni) void loadPhpIni(selectedPhpForIni);
-          }}
+            if (!phpIni) return loadPhpIni(selectedPhpForIni);
+          })())}
         >
           <span class="nav-btn-left">
             <span>⚡</span>
@@ -690,7 +781,13 @@
 
         <button
           class="nav-btn {activeTab === 'mail' ? 'active' : ''}"
-          onclick={() => (activeTab = 'mail')}
+          onclick={() => {
+            activeTab = 'mail';
+            const targetId = selectedMailId || mails[0]?.id || '';
+            if (targetId && (!selectedMailDetail || selectedMailDetail.id !== targetId)) {
+              void selectMail(targetId);
+            }
+          }}
         >
           <span class="nav-btn-left">
             <span>✉</span>
@@ -718,10 +815,10 @@
 
         <button
           class="nav-btn {activeTab === 'logs' ? 'active' : ''}"
-          onclick={() => {
+          onclick={(event) => runButton(event, () => (() => {
             activeTab = 'logs';
-            if (selectedLogPath) void loadLogContent(selectedLogPath);
-          }}
+            if (selectedLogPath) return loadLogContent(selectedLogPath);
+          })())}
         >
           <span class="nav-btn-left">
             <span>☰</span>
@@ -731,10 +828,10 @@
 
         <button
           class="nav-btn {activeTab === 'settings' ? 'active' : ''}"
-          onclick={() => {
+          onclick={(event) => runButton(event, () => (() => {
             activeTab = 'settings';
-            if (!doctorReport) void handleRunDoctor();
-          }}
+            if (!doctorReport) return handleRunDoctor();
+          })())}
         >
           <span class="nav-btn-left">
             <span>⚙</span>
@@ -750,7 +847,7 @@
           <button
             class="btn btn-sm"
             style="padding:1px 6px;font-size:10px;"
-            onclick={() => handleStartOrStopAll(false)}
+            onclick={(event) => runButton(event, () => (() => handleStartOrStopAll(false))())}
           >
             Stop All
           </button>
@@ -785,11 +882,11 @@
           </span>
           <button
             class="btn btn-sm btn-primary"
-            onclick={async () => {
+            onclick={(event) => runButton(event, () => (async () => {
               await call('install_helper');
               await refreshAll();
               notify('CorralHelper berhasil diaktifkan!');
-            }}
+            })())}
           >
             Pasang Helper
           </button>
@@ -880,21 +977,21 @@
                   <div class="site-actions">
                     <button
                       class="btn btn-primary btn-sm"
-                      onclick={() => call('open_in_browser', { siteId: selectedSite.id })}
+                      onclick={(event) => runButton(event, () => (() => call('open_in_browser', { siteId: selectedSite.id }))())}
                       title="Buka situs di browser"
                     >
                       <span>↗</span> Open
                     </button>
                     <button
                       class="btn btn-sm"
-                      onclick={() => call('open_in_editor', { siteId: selectedSite.id })}
+                      onclick={(event) => runButton(event, () => (() => call('open_in_editor', { siteId: selectedSite.id }))())}
                       title="Buka proyek di Code Editor"
                     >
                       <span>&lt;/&gt;</span> Editor
                     </button>
                     <button
                       class="btn btn-sm"
-                      onclick={() => call('open_path', { path: selectedSite.path })}
+                      onclick={(event) => runButton(event, () => (() => call('open_path', { path: selectedSite.path }))())}
                       title="Buka folder di File Explorer"
                     >
                       <span>📁</span> Folder
@@ -982,7 +1079,7 @@
                     <span class="card-title">Konfigurasi Server Situs (Zero-Downtime Reload)</span>
                     <button
                       class="btn btn-sm"
-                      onclick={() => call('open_path', { path: selectedSite.path })}
+                      onclick={(event) => runButton(event, () => (() => call('open_path', { path: selectedSite.path }))())}
                     >
                       Buka di Explorer
                     </button>
@@ -1000,7 +1097,7 @@
                       {#each ['8.1', '8.2', '8.3', '8.4', '8.5'] as ver}
                         <button
                           class="btn btn-sm {selectedSite.phpVersion === ver ? 'btn-primary' : ''}"
-                          onclick={() => handleSwitchPhpSite(selectedSite.id, ver)}
+                          onclick={(event) => runButton(event, () => (() => handleSwitchPhpSite(selectedSite.id, ver))())}
                         >
                           PHP {ver}
                         </button>
@@ -1012,7 +1109,7 @@
                       {#each ['20', '22', '24'] as nver}
                         <button
                           class="btn btn-sm {selectedSite.nodeVersion === nver ? 'btn-primary' : ''}"
-                          onclick={() => handleSwitchNodeSite(selectedSite.id, nver)}
+                          onclick={(event) => runButton(event, () => (() => handleSwitchNodeSite(selectedSite.id, nver))())}
                         >
                           Node {nver}
                         </button>
@@ -1023,7 +1120,7 @@
                     <div style="display:flex;align-items:center;gap:10px;">
                       <button
                         class="btn btn-sm {selectedSite.https ? 'btn-success' : ''}"
-                        onclick={() => handleToggleSiteHttps(selectedSite)}
+                        onclick={(event) => runButton(event, () => (() => handleToggleSiteHttps(selectedSite))())}
                       >
                         {selectedSite.https ? '● HTTPS Aktif (TLS 1.3)' : '○ HTTP Saja (Klik untuk HTTPS)'}
                       </button>
@@ -1070,7 +1167,7 @@
                       {/if}
                       <button
                         class="btn btn-primary"
-                        onclick={() => handleOptimizeLaravel(selectedSite.id)}
+                        onclick={(event) => runButton(event, () => (() => handleOptimizeLaravel(selectedSite.id))())}
                       >
                         ⚡ Apply 1-Click Laravel Turbo
                       </button>
@@ -1121,7 +1218,7 @@
                       />
                       <button
                         class="btn btn-primary btn-sm"
-                        onclick={() => handleRunArtisan(selectedSite.id, customArtisanCmd)}
+                        onclick={(event) => runButton(event, () => (() => handleRunArtisan(selectedSite.id, customArtisanCmd))())}
                       >
                         ▶ Run Artisan
                       </button>
@@ -1132,7 +1229,7 @@
                     {#each ['optimize:clear', 'migrate', 'migrate:fresh --seed', 'storage:link', 'route:list', 'about', 'queue:restart'] as cmd}
                       <button
                         class="btn btn-sm"
-                        onclick={() => handleRunArtisan(selectedSite.id, cmd)}
+                        onclick={(event) => runButton(event, () => (() => handleRunArtisan(selectedSite.id, cmd))())}
                       >
                         php artisan {cmd}
                       </button>
@@ -1191,7 +1288,7 @@
                         </div>
                         <button
                           class="btn {active ? 'btn-success' : ''}"
-                          onclick={() => handleToggleWorker(selectedSite.id, w.kind)}
+                          onclick={(event) => runButton(event, () => (() => handleToggleWorker(selectedSite.id, w.kind))())}
                         >
                           {active ? '● Running (Klik untuk Stop)' : '○ Off (Klik untuk Start)'}
                         </button>
@@ -1211,13 +1308,13 @@
                     <div style="display:flex;gap:8px;">
                       <button
                         class="btn btn-sm"
-                        onclick={() => handleAutofillSiteEnv(selectedSite.id)}
+                        onclick={(event) => runButton(event, () => (() => handleAutofillSiteEnv(selectedSite.id))())}
                       >
                         ✨ Autofill Corral .env
                       </button>
                       <button
                         class="btn btn-primary btn-sm"
-                        onclick={() => handleSaveSiteEnv(selectedSite.id)}
+                        onclick={(event) => runButton(event, () => (() => handleSaveSiteEnv(selectedSite.id))())}
                       >
                         Simpan .env
                       </button>
@@ -1247,7 +1344,7 @@
                       />
                       <button
                         class="btn btn-primary btn-sm"
-                        onclick={() => handleCreateWorkspace(selectedSite.id)}
+                        onclick={(event) => runButton(event, () => (() => handleCreateWorkspace(selectedSite.id))())}
                       >
                         + Buat Workspace
                       </button>
@@ -1274,7 +1371,7 @@
                           <td>
                             <button
                               class="btn btn-danger btn-sm"
-                              onclick={() => handleDeleteWorkspace(ws.id)}
+                              onclick={(event) => runButton(event, () => (() => handleDeleteWorkspace(ws.id))())}
                             >
                               Hapus
                             </button>
@@ -1320,10 +1417,10 @@
             </button>
             <button
               class="subtab-btn {serviceSubTab === 'phpini' ? 'active' : ''}"
-              onclick={() => {
+              onclick={(event) => runButton(event, () => (() => {
                 serviceSubTab = 'phpini';
-                void loadPhpIni(selectedPhpForIni);
-              }}
+                return loadPhpIni(selectedPhpForIni);
+              })())}
             >
               PHP Runtimes &amp; php.ini Editor
             </button>
@@ -1365,20 +1462,20 @@
                         {#if svc.state === 'running'}
                           <button
                             class="btn btn-sm"
-                            onclick={() => handleServiceAction(svc.id, 'restart')}
+                            onclick={(event) => runButton(event, () => (() => handleServiceAction(svc.id, 'restart'))())}
                           >
                             Restart
                           </button>
                           <button
                             class="btn btn-danger btn-sm"
-                            onclick={() => handleServiceAction(svc.id, 'stop')}
+                            onclick={(event) => runButton(event, () => (() => handleServiceAction(svc.id, 'stop'))())}
                           >
                             Stop
                           </button>
                         {:else}
                           <button
                             class="btn btn-primary btn-sm"
-                            onclick={() => handleServiceAction(svc.id, 'start')}
+                            onclick={(event) => runButton(event, () => (() => handleServiceAction(svc.id, 'start'))())}
                           >
                             Start
                           </button>
@@ -1397,13 +1494,13 @@
                   {#each phpVersions as pv}
                     <button
                       class="btn btn-sm {selectedPhpForIni === pv.version ? 'btn-primary' : ''}"
-                      onclick={() => loadPhpIni(pv.version)}
+                      onclick={(event) => runButton(event, () => (() => loadPhpIni(pv.version))())}
                     >
                       PHP {pv.version} {pv.activeGlobal ? '(Global)' : ''}
                     </button>
                   {/each}
                 </div>
-                <button class="btn btn-primary btn-sm" onclick={handleSavePhpIni}>
+                <button class="btn btn-primary btn-sm" onclick={(event) => runButton(event, () => (handleSavePhpIni)())}>
                   Simpan &amp; Reload PHP {selectedPhpForIni}
                 </button>
               </div>
@@ -1415,7 +1512,7 @@
                     <code>{phpIni.rawPath}</code>
                     <button
                       class="btn btn-sm"
-                      onclick={() => call('open_path', { path: phpIni?.rawPath })}
+                      onclick={(event) => runButton(event, () => (() => call('open_path', { path: phpIni?.rawPath }))())}
                     >
                       Buka File
                     </button>
@@ -1470,7 +1567,7 @@
                     placeholder="Nama database baru..."
                     bind:value={newDbName}
                   />
-                  <button class="btn btn-primary btn-sm" onclick={handleCreateDatabase}>
+                  <button class="btn btn-primary btn-sm" onclick={(event) => runButton(event, () => (handleCreateDatabase)())}>
                     + Buat Database
                   </button>
                 </div>
@@ -1498,7 +1595,7 @@
                       <td>
                         <button
                           class="btn btn-danger btn-sm"
-                          onclick={() => handleDropDatabase(db.name)}
+                          onclick={(event) => runButton(event, () => (() => handleDropDatabase(db.name))())}
                         >
                           Drop
                         </button>
@@ -1518,10 +1615,10 @@
               <span style="font-weight:600;flex:1;">
                 Inbox SMTP (:{mailSettings?.smtpPort ?? 1025})
               </span>
-              <button class="btn btn-primary btn-sm" onclick={handleSendTestMail}>
+              <button class="btn btn-primary btn-sm" onclick={(event) => runButton(event, () => (handleSendTestMail)())}>
                 + Kirim Email Uji
               </button>
-              <button class="btn btn-sm" onclick={handleClearMails}>Clear</button>
+              <button class="btn btn-sm" onclick={(event) => runButton(event, () => (handleClearMails)())}>Clear</button>
             </div>
 
             <div class="scroll-list">
@@ -1530,8 +1627,8 @@
                   class="site-item {selectedMail?.id === m.id ? 'selected' : ''}"
                   role="button"
                   tabindex="0"
-                  onclick={() => (selectedMailId = m.id)}
-                  onkeydown={(e) => e.key === 'Enter' && (selectedMailId = m.id)}
+                  onclick={() => void selectMail(m.id)}
+                  onkeydown={(e) => e.key === 'Enter' && void selectMail(m.id)}
                 >
                   <div class="site-item-top">
                     <span style="font-weight:600;font-size:13px;">{m.subject}</span>
@@ -1586,17 +1683,21 @@
                   </div>
                 </div>
 
-                {#if mailPreviewMode === 'html'}
+                {#if loadingMailDetail && (!selectedMailDetail || selectedMailDetail.id !== selectedMail.id)}
+                  <div class="code-box" style="color:var(--text-secondary);">
+                    Memuat konten email...
+                  </div>
+                {:else if mailPreviewMode === 'html'}
                   <iframe
                     title="Sandboxed Email HTML Preview"
-                    sandbox="allow-same-origin"
-                    srcdoc={selectedMail.htmlBody}
+                    sandbox=""
+                    srcdoc={selectedMailDetail?.id === selectedMail.id ? selectedMailDetail.htmlBody : ''}
                     style="width:100%;height:340px;border:1px solid var(--border);border-radius:6px;background:#ffffff;"
                   ></iframe>
                 {:else if mailPreviewMode === 'text'}
-                  <div class="code-box">{selectedMail.textBody}</div>
+                  <div class="code-box">{selectedMailDetail?.id === selectedMail.id ? selectedMailDetail.textBody : ''}</div>
                 {:else}
-                  <div class="code-box">{selectedMail.rawHeaders}</div>
+                  <div class="code-box">{selectedMailDetail?.id === selectedMail.id ? selectedMailDetail.rawHeaders : ''}</div>
                 {/if}
 
                 {#if selectedMail.attachments.length > 0}
@@ -1624,15 +1725,15 @@
               </p>
             </div>
             <div style="display:flex;gap:8px;">
-              <button class="btn btn-primary" onclick={handleSendTestDump}>
+              <button class="btn btn-primary" onclick={(event) => runButton(event, () => (handleSendTestDump)())}>
                 + Simulasi dump($order)
               </button>
               <button
                 class="btn"
-                onclick={async () => {
+                onclick={(event) => runButton(event, () => (async () => {
                   await call('clear_dumps');
                   await refreshAll();
-                }}
+                })())}
               >
                 Clear All
               </button>
@@ -1687,10 +1788,10 @@
             </div>
 
             <div style="display:flex;gap:8px;">
-              <button class="btn btn-sm" onclick={() => loadLogContent(selectedLogPath)}>
+              <button class="btn btn-sm" onclick={(event) => runButton(event, () => (() => loadLogContent(selectedLogPath))())}>
                 ⟳ Refresh
               </button>
-              <button class="btn btn-danger btn-sm" onclick={handleClearLog}>
+              <button class="btn btn-danger btn-sm" onclick={(event) => runButton(event, () => (handleClearLog)())}>
                 Clear Log
               </button>
             </div>
@@ -1713,12 +1814,25 @@
           {#if settings}
             <div class="card">
               <div class="card-header">
+                <span class="card-title">Lokasi PHP</span>
+                <button class="btn btn-primary btn-sm" onclick={(event) => runButton(event, () => (handleSaveSettings)())}>Simpan Pengaturan</button>
+              </div>
+              <p>Masukkan path folder PHP atau php.exe untuk setiap versi. Corral memakainya untuk membuat project dan menjalankan Artisan. Kosongkan untuk menggunakan runtime bawaan Corral.</p>
+              <div class="kv-grid">
+                {#each ['8.5', '8.4', '8.3', '8.2', '8.1'] as version}
+                  <label class="kv-label" for="php-path-{version}">PHP {version}</label>
+                  <input id="php-path-{version}" class="input" type="text" placeholder="C:\php\php-{version}\php.exe" bind:value={settings.phpPaths[version]} />
+                {/each}
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-header">
                 <span class="card-title">Jendela, Tema &amp; System Tray Windows</span>
                 <div style="display:flex;gap:8px;">
-                  <button class="btn btn-sm" onclick={handleMinimizeToTrayNow}>
+                  <button class="btn btn-sm" onclick={(event) => runButton(event, () => (handleMinimizeToTrayNow)())}>
                     ▾ Test Minimize to System Tray
                   </button>
-                  <button class="btn btn-primary btn-sm" onclick={handleSaveSettings}>
+                  <button class="btn btn-primary btn-sm" onclick={(event) => runButton(event, () => (handleSaveSettings)())}>
                     Simpan Pengaturan
                   </button>
                 </div>
@@ -1769,12 +1883,12 @@
                 <div style="display:flex;gap:8px;align-items:center;">
                   {#if certStatus?.caTrusted}
                     <span class="pill pill-https">Trusted ✓</span>
-                    <button class="btn btn-sm" onclick={() => handleTrustCa(false)}>
+                    <button class="btn btn-sm" onclick={(event) => runButton(event, () => (() => handleTrustCa(false))())}>
                       Revoke Trust
                     </button>
                   {:else}
                     <span class="pill">Belum di-trust</span>
-                    <button class="btn btn-primary btn-sm" onclick={() => handleTrustCa(true)}>
+                    <button class="btn btn-primary btn-sm" onclick={(event) => runButton(event, () => (() => handleTrustCa(true))())}>
                       Trust Corral Local CA
                     </button>
                   {/if}
@@ -1787,7 +1901,7 @@
           <div class="card">
             <div class="card-header">
               <span class="card-title">Corral Doctor &amp; Windows Port Conflict Inspector</span>
-              <button class="btn btn-sm" onclick={handleRunDoctor}>
+              <button class="btn btn-sm" onclick={(event) => runButton(event, () => (handleRunDoctor)())}>
                 🩺 Jalankan Diagnostik Ulang
               </button>
             </div>
@@ -1851,9 +1965,19 @@
         <input class="input" placeholder="contoh: saas-billing" bind:value={newSiteName} />
       </label>
       <label style="display:flex;flex-direction:column;gap:4px;">
+        <span style="font-size:12px;color:var(--text-secondary);">Template</span>
+        <select class="select" bind:value={newSiteTemplate} disabled={creatingSite}>
+          <option value="laravel">Laravel</option>
+          <option value="livewire">Laravel + Livewire</option>
+          <option value="react">Laravel + Inertia + React</option>
+          <option value="vue">Laravel + Inertia + Vue.js</option>
+        </select>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:4px;">
         <span style="font-size:12px;color:var(--text-secondary);">Versi PHP FastCGI</span>
         <select class="select" bind:value={newSitePhp}>
           <option value="8.4">PHP 8.4 (Recommended - JIT Turbo)</option>
+          <option value="8.5">PHP 8.5</option>
           <option value="8.3">PHP 8.3</option>
           <option value="8.2">PHP 8.2</option>
         </select>
@@ -1863,8 +1987,8 @@
         <span>Aktifkan HTTPS otomatis (Sertifikat TLS lokal ≤ 396 hari)</span>
       </label>
       <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:6px;">
-        <button class="btn" onclick={() => (showNewSiteModal = false)}>Batal</button>
-        <button class="btn btn-primary" onclick={handleCreateSite}>Buat &amp; Optimasi</button>
+        <button class="btn" disabled={creatingSite} onclick={() => (showNewSiteModal = false)}>Batal</button>
+        <button class="btn btn-primary" disabled={creatingSite} onclick={(event) => runButton(event, () => (handleCreateSite)())}>{creatingSite ? 'Menginstal Laravel…' : 'Buat Situs'}</button>
       </div>
     </div>
   </div>
@@ -1885,7 +2009,7 @@
       </label>
       <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:6px;">
         <button class="btn" onclick={() => (showLinkFolderModal = false)}>Batal</button>
-        <button class="btn btn-primary" onclick={handleLinkFolder}>Link Folder</button>
+        <button class="btn btn-primary" onclick={(event) => runButton(event, () => (handleLinkFolder)())}>Link Folder</button>
       </div>
     </div>
   </div>
@@ -1921,7 +2045,7 @@
       </div>
       <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:6px;">
         <button class="btn" onclick={() => (showExtraServiceModal = false)}>Batal</button>
-        <button class="btn btn-primary" onclick={handleCreateExtraService}>Tambah Service</button>
+        <button class="btn btn-primary" onclick={(event) => runButton(event, () => (handleCreateExtraService)())}>Tambah Service</button>
       </div>
     </div>
   </div>
@@ -1967,13 +2091,13 @@
         </button>
         <button
           class="btn btn-danger"
-          onclick={async () => {
+          onclick={(event) => runButton(event, () => (async () => {
             if (siteToDelete) {
               const toDelete = siteToDelete;
-              siteToDelete = null;
               await handleDeleteSite(toDelete.id, toDelete.host);
+              siteToDelete = null;
             }
-          }}
+          })())}
         >
           🗑 Hapus Situs
         </button>
@@ -1997,31 +2121,31 @@
     </div>
     <button
       class="context-menu-item"
-      onclick={() => {
+      onclick={(event) => runButton(event, async () => {
         const id = siteContextMenu?.site.id;
+        if (id) await call('open_in_browser', { siteId: id });
         closeSiteContextMenu();
-        if (id) call('open_in_browser', { siteId: id });
-      }}
+      })}
     >
       <span>↗</span> Buka di Browser
     </button>
     <button
       class="context-menu-item"
-      onclick={() => {
+      onclick={(event) => runButton(event, async () => {
         const id = siteContextMenu?.site.id;
+        if (id) await call('open_in_editor', { siteId: id });
         closeSiteContextMenu();
-        if (id) call('open_in_editor', { siteId: id });
-      }}
+      })}
     >
       <span>&lt;/&gt;</span> Buka di Editor
     </button>
     <button
       class="context-menu-item"
-      onclick={() => {
+      onclick={(event) => runButton(event, async () => {
         const path = siteContextMenu?.site.path;
+        if (path) await call('open_path', { path });
         closeSiteContextMenu();
-        if (path) call('open_path', { path });
-      }}
+      })}
     >
       <span>📁</span> Buka Folder di Explorer
     </button>
@@ -2048,9 +2172,15 @@
   }}
 />
 
-{#if toastMessage}
-  <div class="toast-bar" role="status">
-    <span class="dot {toastKind === 'error' ? 'failed' : 'up'}"></span>
-    <span>{toastMessage}</span>
+{#if notifications.length > 0}
+  <div class="modal-backdrop notification-backdrop">
+    <div class="modal-card notification-card" role="alertdialog" tabindex="-1" aria-modal="true" aria-labelledby="notification-title" aria-describedby="notification-message" use:focusNotification onkeydown={(event) => { if (event.key === 'Escape') { event.stopPropagation(); dismissNotification(); } else if (event.key === 'Tab') { event.preventDefault(); } }}>
+      <div class="notification-heading">
+        <span class="notification-icon {notifications[0].kind}" aria-hidden="true">{notifications[0].kind === 'error' ? '!' : notifications[0].kind === 'info' ? 'i' : '✓'}</span>
+        <h3 id="notification-title">{notifications[0].kind === 'error' ? 'Terjadi kesalahan' : notifications[0].kind === 'info' ? 'Informasi' : 'Berhasil'}</h3>
+      </div>
+      <p id="notification-message">{notifications[0].message}</p>
+      <div class="notification-actions"><button class="btn btn-primary" onclick={dismissNotification}>Tutup</button></div>
+    </div>
   </div>
 {/if}
